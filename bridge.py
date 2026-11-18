@@ -54,10 +54,35 @@ LIVEKIT_SECRET = os.environ.get("LIVEKIT_API_SECRET", os.environ.get("LIVEKIT_SE
 ROOM_NAME = os.environ.get("LIVEKIT_ROOM", "landline")
 
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "nuralam9922").strip()
-MAX_CALL_DURATION_SEC = int(os.environ.get("MAX_CALL_DURATION_SEC", 1800))  # 30m max call
+INACTIVITY_TIMEOUT_SEC = int(os.environ.get("INACTIVITY_TIMEOUT_SEC", 900))  # 15m dead-air silence timeout
 RING_TIMEOUT_SEC = int(os.environ.get("RING_TIMEOUT_SEC", 45))  # 45s ringing timeout
 MAX_CALLS_PER_MIN = int(os.environ.get("MAX_CALLS_PER_MIN", 6))
 MAX_REQ_PER_MIN = int(os.environ.get("MAX_REQ_PER_MIN", 60))
+
+CLIENT_WEBSOCKETS = set()
+
+def notify_status_change():
+    """Schedules a status broadcast to all connected Android WebSocket clients."""
+    if CLIENT_WEBSOCKETS:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(broadcast_status())
+        except RuntimeError:
+            pass
+
+async def broadcast_status():
+    if not CLIENT_WEBSOCKETS:
+        return
+    payload = STATS.as_dict()
+    dead = []
+    for ws in list(CLIENT_WEBSOCKETS):
+        try:
+            if not ws.closed:
+                await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        CLIENT_WEBSOCKETS.discard(ws)
 
 # Protocol Opcodes (ESP32 <-> Gateway)
 PKT_CONTROL     = 0x01
@@ -186,6 +211,7 @@ class DeviceCallLock:
         self.active_caller_id = None
         self.call_start_time = None
         self.ring_start_time = None
+        self.last_activity_time = time.time()
         self.call_queue = []  # list of {"call_id": ..., "caller_id": ..., "queued_at": ..., "token_data": ...}
         self.rx_bytes = 0
         self.tx_bytes = 0
@@ -202,6 +228,7 @@ class DeviceCallLock:
             call_dur = int(time.time() - self.call_start_time)
         return {
             "device_id": self.device_id,
+            "device_name": "হোম ল্যান্ডলাইন",
             "online": self.device_addr is not None,
             "state": self.state.lower(),
             "availability": "available" if self.state == "IDLE" else "busy",
@@ -209,7 +236,7 @@ class DeviceCallLock:
             "active_call_id": self.active_call_id,
             "active_caller_id": self.active_caller_id,
             "call_duration_sec": call_dur,
-            "max_call_duration_sec": MAX_CALL_DURATION_SEC,
+            "inactivity_timeout_sec": INACTIVITY_TIMEOUT_SEC,
             "queue_len": len(self.call_queue),
             "queued_callers": [q["caller_id"] for q in self.call_queue],
             "rx_dbfs": round(self.rx_dbfs, 1),
@@ -560,10 +587,10 @@ class TelephoneManager:
                     if now - STATS.ring_start_time > RING_TIMEOUT_SEC:
                         print(f"[watchdog] Ringing timed out after {RING_TIMEOUT_SEC}s -> auto-cancelling", flush=True)
                         self.on_button_hangup(notify_esp=True)
-                elif STATS.state == "IN_CALL" and STATS.call_start_time:
-                    dur = now - STATS.call_start_time
-                    if dur > MAX_CALL_DURATION_SEC:
-                        print(f"[watchdog] Max call duration reached ({dur:.0f}s >= {MAX_CALL_DURATION_SEC}s) -> hanging up", flush=True)
+                elif STATS.state in ("IN_CALL", "ON_HOLD"):
+                    idle_sec = now - STATS.last_activity_time
+                    if idle_sec > INACTIVITY_TIMEOUT_SEC:
+                        print(f"[watchdog] Dead air silence detected ({idle_sec:.0f}s >= {INACTIVITY_TIMEOUT_SEC}s) -> releasing abandoned call", flush=True)
                         self.on_button_hangup(notify_esp=True)
             except asyncio.CancelledError:
                 break
@@ -590,6 +617,7 @@ class TelephoneManager:
             await self.livekit.stop()
 
     def on_device_audio(self, pcm: bytes):
+        STATS.last_activity_time = time.time()
         if STATS.state == "IN_CALL" and not STATS.is_on_hold:
             self.livekit.push_uplink(pcm)
 
@@ -601,6 +629,7 @@ class TelephoneManager:
         else:
             STATS.state = "IN_CALL"
             print(f"[call] call {STATS.active_call_id} resumed from HOLD", flush=True)
+        notify_status_change()
 
     def promote_next_queued_caller(self):
         if not STATS.call_queue:
@@ -614,8 +643,10 @@ class TelephoneManager:
         STATS.active_call_id = call_id
         STATS.active_caller_id = caller_id
         STATS.ring_start_time = time.time()
+        STATS.last_activity_time = time.time()
         self.device_link.ring_device()
         asyncio.create_task(self.start_call_session())
+        notify_status_change()
         return True
 
     def on_button_accept(self):
@@ -624,7 +655,9 @@ class TelephoneManager:
         STATS.is_on_hold = False
         STATS.call_start_time = time.time()
         STATS.ring_start_time = None
+        STATS.last_activity_time = time.time()
         asyncio.create_task(self.start_call_session())
+        notify_status_change()
 
     def on_button_hangup(self, notify_esp=True):
         print("[call] call ended: releasing listener lock", flush=True)
@@ -637,6 +670,7 @@ class TelephoneManager:
         if notify_esp:
             self.device_link.send_call_end()
         asyncio.create_task(self.stop_call_session())
+        notify_status_change()
 
         # If any caller is queued, promote them automatically after brief pause
         if STATS.call_queue:
@@ -777,6 +811,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         STATS.active_call_id = call_id
         STATS.active_caller_id = caller_id
         STATS.ring_start_time = time.time()
+        notify_status_change()
 
         mgr.device_link.ring_device()
         asyncio.create_task(mgr.start_call_session())
@@ -892,6 +927,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         mgr.device_link.ws = ws
         STATS.device_addr = (remote_ip, 443)
         STATS.state = "IDLE"
+        notify_status_change()
 
         try:
             async for msg in ws:
@@ -925,6 +961,26 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                 STATS.device_addr = None
                 if STATS.state != "IDLE":
                     mgr.on_button_hangup(notify_esp=False)
+                notify_status_change()
+
+        return ws
+
+    # Real-time WebSocket Status Push for Android Clients
+    async def client_ws_handler(request):
+        if not check_auth(request):
+            return web.Response(status=401, text="Unauthorized: invalid auth token")
+
+        ws = web.WebSocketResponse(heartbeat=20.0)
+        await ws.prepare(request)
+        CLIENT_WEBSOCKETS.add(ws)
+        try:
+            # Immediately send initial state
+            await ws.send_json(STATS.as_dict())
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT and msg.data == "ping":
+                    await ws.send_str("pong")
+        finally:
+            CLIENT_WEBSOCKETS.discard(ws)
 
         return ws
 
@@ -947,6 +1003,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
     app.router.add_get("/call/poll", call_poll_handler)
     app.router.add_post("/hangup", call_end_handler)
     app.router.add_get("/esp32/ws", esp32_ws_handler)
+    app.router.add_get("/client/ws", client_ws_handler)
     app.router.add_get("/", root_handler)
 
     return app
@@ -959,8 +1016,8 @@ async def main():
 
     STATS.state = "IDLE"
     print(f"[backend] ESP32 Internet Calling Gateway started on port {HTTP_PORT}", flush=True)
-    print(f"[backend] Single-Listener Policy active (MAX_CALL_DURATION={MAX_CALL_DURATION_SEC}s, RING_TIMEOUT={RING_TIMEOUT_SEC}s)", flush=True)
-    print(f"[backend] Direct WebSocket & REST API enabled at /esp32/ws and /call/*", flush=True)
+    print(f"[backend] Dead-Air Silence Safeguard active (INACTIVITY_TIMEOUT={INACTIVITY_TIMEOUT_SEC}s, RING_TIMEOUT={RING_TIMEOUT_SEC}s)", flush=True)
+    print(f"[backend] Direct WebSocket & REST API enabled at /esp32/ws, /client/ws and /call/*", flush=True)
 
     app = create_app(mgr)
     runner = web.AppRunner(app)
