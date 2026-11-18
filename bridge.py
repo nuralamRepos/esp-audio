@@ -176,15 +176,17 @@ class AudioProcessor:
 # ---------------------------------------------------------------- Backend Call State & Telemetry
 
 class DeviceCallLock:
-    """Enforces atomic single-active-call policy."""
+    """Enforces atomic single-active-call policy with queueing, hold & reject."""
     def __init__(self):
         self.device_id = DEVICE_ID
         self.device_addr = None
-        self.state = "IDLE"  # IDLE, RINGING, IN_CALL
+        self.state = "IDLE"  # IDLE, RINGING, IN_CALL, ON_HOLD
+        self.is_on_hold = False
         self.active_call_id = None
         self.active_caller_id = None
         self.call_start_time = None
         self.ring_start_time = None
+        self.call_queue = []  # list of {"call_id": ..., "caller_id": ..., "queued_at": ..., "token_data": ...}
         self.rx_bytes = 0
         self.tx_bytes = 0
         self.rx_frames = 0
@@ -196,17 +198,20 @@ class DeviceCallLock:
 
     def as_dict(self):
         call_dur = 0
-        if self.state == "IN_CALL" and self.call_start_time:
+        if self.state in ("IN_CALL", "ON_HOLD") and self.call_start_time:
             call_dur = int(time.time() - self.call_start_time)
         return {
             "device_id": self.device_id,
             "online": self.device_addr is not None,
             "state": self.state.lower(),
             "availability": "available" if self.state == "IDLE" else "busy",
+            "on_hold": self.is_on_hold,
             "active_call_id": self.active_call_id,
             "active_caller_id": self.active_caller_id,
             "call_duration_sec": call_dur,
             "max_call_duration_sec": MAX_CALL_DURATION_SEC,
+            "queue_len": len(self.call_queue),
+            "queued_callers": [q["caller_id"] for q in self.call_queue],
             "rx_dbfs": round(self.rx_dbfs, 1),
             "tx_dbfs": round(self.tx_dbfs, 1),
             "uptime_sec": int(time.time() - self.start_time),
@@ -374,13 +379,14 @@ class DownlinkPacer:
                 try:
                     chunk = self.queue.get_nowait()
                 except asyncio.QueueEmpty:
-                    if STATS.state == "IN_CALL":
+                    if STATS.state == "IN_CALL" and not STATS.is_on_hold:
                         chunk = b"\x00" * FRAME_BYTES
                     else:
                         continue
 
-                filtered = self.processor.process_pcm16(chunk)
-                self.device_link.send_audio(filtered)
+                if not STATS.is_on_hold:
+                    filtered = self.processor.process_pcm16(chunk)
+                    self.device_link.send_audio(filtered)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -584,12 +590,38 @@ class TelephoneManager:
             await self.livekit.stop()
 
     def on_device_audio(self, pcm: bytes):
-        if STATS.state == "IN_CALL":
+        if STATS.state == "IN_CALL" and not STATS.is_on_hold:
             self.livekit.push_uplink(pcm)
+
+    def set_hold(self, hold: bool):
+        STATS.is_on_hold = hold
+        if hold:
+            STATS.state = "ON_HOLD"
+            print(f"[call] call {STATS.active_call_id} placed on HOLD", flush=True)
+        else:
+            STATS.state = "IN_CALL"
+            print(f"[call] call {STATS.active_call_id} resumed from HOLD", flush=True)
+
+    def promote_next_queued_caller(self):
+        if not STATS.call_queue:
+            return False
+        next_caller = STATS.call_queue.pop(0)
+        caller_id = next_caller["caller_id"]
+        call_id = f"call_{int(time.time())}_{caller_id}"
+        print(f"[queue] Promoting queued caller '{caller_id}' to active ringing call ({call_id})", flush=True)
+        STATS.state = "RINGING"
+        STATS.is_on_hold = False
+        STATS.active_call_id = call_id
+        STATS.active_caller_id = caller_id
+        STATS.ring_start_time = time.time()
+        self.device_link.ring_device()
+        asyncio.create_task(self.start_call_session())
+        return True
 
     def on_button_accept(self):
         print("[call] answered on hardware; connecting audio on-demand", flush=True)
         STATS.state = "IN_CALL"
+        STATS.is_on_hold = False
         STATS.call_start_time = time.time()
         STATS.ring_start_time = None
         asyncio.create_task(self.start_call_session())
@@ -597,6 +629,7 @@ class TelephoneManager:
     def on_button_hangup(self, notify_esp=True):
         print("[call] call ended: releasing listener lock", flush=True)
         STATS.state = "IDLE"
+        STATS.is_on_hold = False
         STATS.active_call_id = None
         STATS.active_caller_id = None
         STATS.call_start_time = None
@@ -604,6 +637,10 @@ class TelephoneManager:
         if notify_esp:
             self.device_link.send_call_end()
         asyncio.create_task(self.stop_call_session())
+
+        # If any caller is queued, promote them automatically after brief pause
+        if STATS.call_queue:
+            asyncio.get_running_loop().call_later(1.0, self.promote_next_queued_caller)
 
 # ---------------------------------------------------------------- Token Generator
 
@@ -676,12 +713,54 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         if not check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
 
-        if STATS.state in ("IN_CALL", "RINGING"):
+        if STATS.state in ("IN_CALL", "RINGING", "ON_HOLD"):
+            queue_requested = False
+            caller_id = "android-caller"
+            try:
+                body = await request.json()
+                queue_requested = body.get("queue", False)
+                caller_id = body.get("caller_id", "android-caller")
+            except Exception:
+                pass
+
+            if queue_requested:
+                if len(STATS.call_queue) >= 3:
+                    return web.json_response({
+                        "error": "queue_full",
+                        "detail": "Call queue is full (max 3 waiting callers)",
+                        "active_caller_id": STATS.active_caller_id
+                    }, status=486)
+                
+                # Check if already in queue
+                existing = next((q for q in STATS.call_queue if q["caller_id"] == caller_id), None)
+                if not existing:
+                    call_id = f"queue_{int(time.time())}_{caller_id}"
+                    item = {
+                        "call_id": call_id,
+                        "caller_id": caller_id,
+                        "queued_at": time.time(),
+                        "status": "queued"
+                    }
+                    STATS.call_queue.append(item)
+                else:
+                    item = existing
+                
+                pos = STATS.call_queue.index(item) + 1
+                print(f"[queue] Caller '{caller_id}' queued at position {pos}", flush=True)
+                return web.json_response({
+                    "status": "queued",
+                    "call_id": item["call_id"],
+                    "caller_id": caller_id,
+                    "queue_position": pos,
+                    "target_device": DEVICE_ID
+                }, status=202)
+
             return web.json_response({
                 "error": "busy",
                 "detail": "ESP32 listener is currently on another call",
                 "active_call_id": STATS.active_call_id,
-                "active_caller_id": STATS.active_caller_id
+                "active_caller_id": STATS.active_caller_id,
+                "queue_len": len(STATS.call_queue)
             }, status=486)
 
         caller_id = "android-caller"
@@ -718,6 +797,87 @@ def create_app(mgr: TelephoneManager) -> web.Application:
             return web.json_response({"error": "unauthorized"}, status=401)
         mgr.on_button_hangup()
         return web.json_response({"status": "ended", "device": DEVICE_ID})
+
+    async def call_hold_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if STATS.state not in ("IN_CALL", "ON_HOLD"):
+            return web.json_response({"error": "not_in_call", "detail": "No active call to hold or resume"}, status=400)
+        
+        hold = True
+        try:
+            body = await request.json()
+            hold = body.get("hold", not STATS.is_on_hold)
+        except Exception:
+            hold = not STATS.is_on_hold
+        
+        mgr.set_hold(hold)
+        return web.json_response({
+            "status": "holding" if hold else "active",
+            "on_hold": hold,
+            "call_id": STATS.active_call_id
+        })
+
+    async def call_reject_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        caller_id = None
+        try:
+            body = await request.json()
+            caller_id = body.get("caller_id")
+        except Exception:
+            pass
+        
+        if STATS.state == "RINGING" and (caller_id is None or STATS.active_caller_id == caller_id):
+            print(f"[call] Ringing call rejected for caller '{STATS.active_caller_id}'", flush=True)
+            mgr.on_button_hangup()
+            return web.json_response({"status": "rejected", "detail": "call rejected"})
+        
+        if caller_id:
+            STATS.call_queue = [q for q in STATS.call_queue if q["caller_id"] != caller_id]
+            print(f"[queue] Removed caller '{caller_id}' from queue upon reject/cancel", flush=True)
+            return web.json_response({"status": "dequeued", "caller_id": caller_id})
+        
+        return web.json_response({"status": "ok", "state": STATS.state.lower()})
+
+    async def call_poll_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        
+        caller_id = request.query.get("caller_id", "")
+        call_id = request.query.get("call_id", "")
+        
+        is_active = (caller_id and STATS.active_caller_id == caller_id) or (call_id and STATS.active_call_id == call_id)
+        
+        queue_pos = -1
+        in_queue = False
+        for idx, q in enumerate(STATS.call_queue):
+            if (caller_id and q["caller_id"] == caller_id) or (call_id and q["call_id"] == call_id):
+                queue_pos = idx + 1
+                in_queue = True
+                break
+        
+        token_info = None
+        if is_active and STATS.state in ("RINGING", "IN_CALL", "ON_HOLD"):
+            cred = generate_caller_token(caller_id or STATS.active_caller_id or "android-caller")
+            token_info = {
+                "room": cred["room"],
+                "livekit_url": cred["url"],
+                "token": cred["token"]
+            }
+
+        return web.json_response({
+            "state": STATS.state.lower(),
+            "availability": "available" if STATS.state == "IDLE" else "busy",
+            "is_active_caller": is_active,
+            "active_call_id": STATS.active_call_id,
+            "active_caller_id": STATS.active_caller_id,
+            "on_hold": STATS.is_on_hold,
+            "in_queue": in_queue,
+            "queue_position": queue_pos,
+            "queue_len": len(STATS.call_queue),
+            "credentials": token_info
+        })
 
     # Direct WebSocket Connection for ESP32 Hardware
     async def esp32_ws_handler(request):
@@ -782,6 +942,9 @@ def create_app(mgr: TelephoneManager) -> web.Application:
     app.router.add_get("/devices", devices_handler)
     app.router.add_post("/call/start", call_start_handler)
     app.router.add_post("/call/end", call_end_handler)
+    app.router.add_post("/call/hold", call_hold_handler)
+    app.router.add_post("/call/reject", call_reject_handler)
+    app.router.add_get("/call/poll", call_poll_handler)
     app.router.add_post("/hangup", call_end_handler)
     app.router.add_get("/esp32/ws", esp32_ws_handler)
     app.router.add_get("/", root_handler)
