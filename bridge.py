@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-esp-telephone audio bridge & backend (Native Android App Architecture).
+esp-telephone audio bridge & backend (Production aiohttp WebSocket & REST).
 Connects Multiple Android App Callers -> Single ESP32 Hardware Listener.
 
-System Roles:
-  - Android Applications: UI, native audio hardware (AEC/NS/AGC), call controls, permissions.
+Architecture:
+  - Android Applications: UI, native audio hardware (AEC/NS/AGC), call controls.
   - Custom Backend: Authentication, atomic call locking (single-active-call policy), token issuance.
-  - LiveKit Cloud: Real-time WebRTC media server for voice conference.
-  - Media Gateway: Linux bridge converting ESP32 lightweight UDP audio <-> LiveKit room audio.
-  - ESP32: Lightweight audio hardware (16kHz mSBC) + physical button. (No WebRTC on chip).
+  - LiveKit Cloud: Real-time WebRTC media conference.
+  - Media Gateway: Bridges ESP32 WebSocket / UDP audio <-> LiveKit room audio.
+  - ESP32: Lightweight audio hardware (16kHz mSBC) + physical button.
 """
 
 import asyncio
@@ -20,9 +20,9 @@ import struct
 import sys
 import time
 from collections import deque
-from urllib.parse import urlparse, parse_qs
 import hmac
 import numpy as np
+from aiohttp import web
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -52,7 +52,6 @@ LIVEKIT_KEY = os.environ.get("LIVEKIT_API_KEY", os.environ.get("LIVEKIT_KEY", "A
 LIVEKIT_SECRET = os.environ.get("LIVEKIT_API_SECRET", os.environ.get("LIVEKIT_SECRET", "39eygVhnkYtXPhW93JZKPVufdN6ozvBLGzCXwSenrjOA"))
 ROOM_NAME = os.environ.get("LIVEKIT_ROOM", "landline")
 
-# Security and Policy
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "nuralam9922").strip()
 MAX_CALL_DURATION_SEC = int(os.environ.get("MAX_CALL_DURATION_SEC", 1800))  # 30m max call
 RING_TIMEOUT_SEC = int(os.environ.get("RING_TIMEOUT_SEC", 45))  # 45s ringing timeout
@@ -98,19 +97,19 @@ class RateLimiter:
 
 RATE_LIMITER = RateLimiter()
 
-def check_auth(headers: dict, query_params: dict) -> bool:
-    """Verifies that the request comes from an authorized Android application."""
+def check_auth(request: web.Request) -> bool:
+    """Verifies that the request comes from an authorized Android application or ESP32."""
     if not AUTH_TOKEN:
         return True
-    token = headers.get("x-auth-token")
+    token = request.headers.get("x-auth-token")
     if not token:
-        auth_hdr = headers.get("authorization", "")
+        auth_hdr = request.headers.get("authorization", "")
         if auth_hdr.lower().startswith("bearer "):
             token = auth_hdr[7:].strip()
         elif auth_hdr:
             token = auth_hdr.strip()
     if not token:
-        token = query_params.get("auth", [""])[0] or query_params.get("token", [""])[0]
+        token = request.query.get("auth", "") or request.query.get("token", "")
 
     if not token:
         return False
@@ -127,12 +126,10 @@ class AudioProcessor:
         self.target_peak = 18000.0
 
     def _init_filters(self):
-        # HPF 300 Hz @ 16 kHz
         self.hp_b = np.array([0.92006, -1.84013, 0.92006], dtype=np.float32)
         self.hp_a = np.array([1.0, -1.83373, 0.84653], dtype=np.float32)
         self.hp_z = np.zeros(2, dtype=np.float32)
 
-        # LPF 3400 Hz @ 16 kHz
         self.lp_b = np.array([0.24524, 0.49048, 0.24524], dtype=np.float32)
         self.lp_a = np.array([1.0, -0.40795, 0.38890], dtype=np.float32)
         self.lp_z = np.zeros(2, dtype=np.float32)
@@ -142,7 +139,6 @@ class AudioProcessor:
             return b""
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
 
-        # 1. HPF (300 Hz)
         y_hp = np.empty_like(samples)
         for i, x in enumerate(samples):
             y = self.hp_b[0] * x + self.hp_z[0]
@@ -150,7 +146,6 @@ class AudioProcessor:
             self.hp_z[1] = self.hp_b[2] * x - self.hp_a[2] * y
             y_hp[i] = y
 
-        # 2. LPF (3400 Hz)
         y_lp = np.empty_like(y_hp)
         for i, x in enumerate(y_hp):
             y = self.lp_b[0] * x + self.lp_z[0]
@@ -158,7 +153,6 @@ class AudioProcessor:
             self.lp_z[1] = self.lp_b[2] * x - self.lp_a[2] * y
             y_lp[i] = y
 
-        # 3. AGC
         cur_peak = float(np.max(np.abs(y_lp))) if len(y_lp) > 0 else 0.0
         if cur_peak > 100.0:
             target_g = self.target_peak / cur_peak
@@ -170,7 +164,6 @@ class AudioProcessor:
 
         out = y_lp * self.gain
 
-        # 4. Soft Limiter
         limit = 32000.0
         mask = np.abs(out) > limit
         if np.any(mask):
@@ -182,10 +175,7 @@ class AudioProcessor:
 # ---------------------------------------------------------------- Backend Call State & Telemetry
 
 class DeviceCallLock:
-    """
-    Enforces atomic single-active-call policy.
-    One ESP32 listener <-> Only one active Android caller at a time.
-    """
+    """Enforces atomic single-active-call policy."""
     def __init__(self):
         self.device_id = DEVICE_ID
         self.device_addr = None
@@ -232,17 +222,70 @@ def compute_dbfs(pcm: bytes):
         return -120.0
     return max(-120.0, 20.0 * np.log10(peak / 32767.0))
 
-# ---------------------------------------------------------------- UDP Link with ESP32 Hardware
+# ---------------------------------------------------------------- Dual Device Link (WebSocket & UDP)
 
-class UdpLinkProtocol(asyncio.DatagramProtocol):
+class DeviceLink:
+    """Unified transport supporting direct WebSocket connection and local UDP."""
     def __init__(self, on_audio_rx, on_call_accept, on_call_end):
         self.on_audio_rx = on_audio_rx
         self.on_call_accept = on_call_accept
         self.on_call_end = on_call_end
-        self.transport = None
+        self.ws = None
+        self.udp_transport = None
+        self.udp_addr = None
+
+    def send_audio(self, pcm: bytes):
+        if self.ws and not self.ws.closed:
+            try:
+                asyncio.create_task(self.ws.send_bytes(bytes([PKT_AUDIO]) + pcm))
+                STATS.tx_bytes += len(pcm)
+                STATS.tx_frames += 1
+                STATS.tx_dbfs = compute_dbfs(pcm)
+            except Exception:
+                pass
+        elif self.udp_transport and self.udp_addr:
+            self.udp_transport.sendto(bytes([PKT_AUDIO]) + pcm, self.udp_addr)
+            STATS.tx_bytes += len(pcm)
+            STATS.tx_frames += 1
+            STATS.tx_dbfs = compute_dbfs(pcm)
+
+    def ring_device(self):
+        print("[link] ringing ESP32 hardware", flush=True)
+        if self.ws and not self.ws.closed:
+            try:
+                asyncio.create_task(self.ws.send_bytes(bytes([PKT_CALL_RING])))
+            except Exception:
+                pass
+        elif self.udp_transport and self.udp_addr:
+            self.udp_transport.sendto(bytes([PKT_CALL_RING]), self.udp_addr)
+
+    def send_call_end(self):
+        print("[link] sending call end to ESP32", flush=True)
+        if self.ws and not self.ws.closed:
+            try:
+                asyncio.create_task(self.ws.send_bytes(bytes([PKT_CALL_END])))
+            except Exception:
+                pass
+        elif self.udp_transport and self.udp_addr:
+            self.udp_transport.sendto(bytes([PKT_CALL_END]), self.udp_addr)
+
+    def send_call_busy(self):
+        if self.ws and not self.ws.closed:
+            try:
+                asyncio.create_task(self.ws.send_bytes(bytes([PKT_CALL_BUSY])))
+            except Exception:
+                pass
+        elif self.udp_transport and self.udp_addr:
+            self.udp_transport.sendto(bytes([PKT_CALL_BUSY]), self.udp_addr)
+
+# ---------------------------------------------------------------- UDP Link Protocol (Fallback)
+
+class UdpLinkProtocol(asyncio.DatagramProtocol):
+    def __init__(self, device_link: DeviceLink):
+        self.device_link = device_link
 
     def connection_made(self, transport):
-        self.transport = transport
+        self.device_link.udp_transport = transport
         print(f"[udp] listening on port {UDP_PORT}", flush=True)
 
     def datagram_received(self, data, addr):
@@ -251,57 +294,40 @@ class UdpLinkProtocol(asyncio.DatagramProtocol):
         kind = data[0]
 
         if kind == PKT_CONTROL:
-            if STATS.device_addr != addr:
+            if self.device_link.udp_addr != addr:
                 print(f"[udp] ESP32 hardware discovered at {addr[0]}:{addr[1]}", flush=True)
+                self.device_link.udp_addr = addr
                 STATS.device_addr = addr
-            self.transport.sendto(bytes([PKT_CONTROL]) + b"HERE", addr)
+            self.device_link.udp_transport.sendto(bytes([PKT_CONTROL]) + b"HERE", addr)
 
         elif kind == PKT_PING:
+            self.device_link.udp_addr = addr
             STATS.device_addr = addr
-            self.transport.sendto(bytes([PKT_PONG]), addr)
+            self.device_link.udp_transport.sendto(bytes([PKT_PONG]), addr)
 
         elif kind == PKT_AUDIO:
+            self.device_link.udp_addr = addr
             STATS.device_addr = addr
             pcm = data[1:]
             STATS.rx_bytes += len(pcm)
             STATS.rx_frames += 1
             STATS.rx_dbfs = compute_dbfs(pcm)
-            self.on_audio_rx(pcm)
+            self.device_link.on_audio_rx(pcm)
 
         elif kind == PKT_CALL_ACCEPT:
             print("[udp] ESP32 physical button pressed: ACCEPT CALL", flush=True)
-            self.on_call_accept()
+            self.device_link.on_call_accept()
 
         elif kind == PKT_CALL_END:
             print("[udp] ESP32 physical button pressed: HANG UP", flush=True)
-            self.on_call_end(notify_esp=False)
-
-    def send_audio(self, pcm: bytes):
-        if not STATS.device_addr or not self.transport:
-            return
-        self.transport.sendto(bytes([PKT_AUDIO]) + pcm, STATS.device_addr)
-        STATS.tx_bytes += len(pcm)
-        STATS.tx_frames += 1
-        STATS.tx_dbfs = compute_dbfs(pcm)
-
-    def ring_device(self):
-        if STATS.device_addr and self.transport:
-            self.transport.sendto(bytes([PKT_CALL_RING]), STATS.device_addr)
-
-    def send_call_end(self):
-        if STATS.device_addr and self.transport:
-            self.transport.sendto(bytes([PKT_CALL_END]), STATS.device_addr)
-
-    def send_call_busy(self):
-        if STATS.device_addr and self.transport:
-            self.transport.sendto(bytes([PKT_CALL_BUSY]), STATS.device_addr)
+            self.device_link.on_call_end(notify_esp=False)
 
 # ---------------------------------------------------------------- Downlink Pacer Queue
 
 class DownlinkPacer:
     """Buffers incoming WebRTC frames and drains them at strict 20ms intervals."""
-    def __init__(self, udp_link: UdpLinkProtocol):
-        self.udp_link = udp_link
+    def __init__(self, device_link: DeviceLink):
+        self.device_link = device_link
         self.queue = asyncio.Queue(maxsize=15)
         self.processor = AudioProcessor(DEVICE_RATE)
         self.task = None
@@ -353,7 +379,7 @@ class DownlinkPacer:
                         continue
 
                 filtered = self.processor.process_pcm16(chunk)
-                self.udp_link.send_audio(filtered)
+                self.device_link.send_audio(filtered)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -363,8 +389,7 @@ class DownlinkPacer:
 
 class LiveKitSession:
     """Server-side participant that bridges ESP32 audio <-> LiveKit Room."""
-    def __init__(self, udp_link: UdpLinkProtocol, pacer: DownlinkPacer, on_empty_room=None):
-        self.udp_link = udp_link
+    def __init__(self, pacer: DownlinkPacer, on_empty_room=None):
         self.pacer = pacer
         self.on_empty_room = on_empty_room
         self.room = None
@@ -486,50 +511,52 @@ class LiveKitSession:
             self.room = None
         self.source = None
 
-# ---------------------------------------------------------------- Telephone Manager & Call Locking
+# ---------------------------------------------------------------- Telephone Manager
 
 class TelephoneManager:
     def __init__(self):
-        self.udp = None
+        self.device_link = None
         self.pacer = None
         self.livekit = None
         self._watchdog_task = None
 
     async def init(self):
         loop = asyncio.get_running_loop()
-        self.udp = UdpLinkProtocol(
+        self.device_link = DeviceLink(
             on_audio_rx=self.on_device_audio,
             on_call_accept=self.on_button_accept,
             on_call_end=self.on_button_hangup
         )
-        await loop.create_datagram_endpoint(lambda: self.udp, local_addr=("0.0.0.0", UDP_PORT))
 
-        self.pacer = DownlinkPacer(self.udp)
+        # Attempt to bind local UDP port 8081 (runs concurrently with WebSocket)
+        try:
+            udp_proto = UdpLinkProtocol(self.device_link)
+            await loop.create_datagram_endpoint(lambda: udp_proto, local_addr=("0.0.0.0", UDP_PORT))
+        except Exception as e:
+            print(f"[udp] note: UDP bind ({UDP_PORT}) skipped or unavailable: {e}", flush=True)
+
+        self.pacer = DownlinkPacer(self.device_link)
         self.pacer.start()
 
         self.livekit = LiveKitSession(
-            self.udp,
             self.pacer,
             on_empty_room=self.on_remote_empty
         )
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     async def _watchdog_loop(self):
-        """Monitors ringing timeouts and maximum call duration to preserve LiveKit quota."""
         while True:
             try:
                 await asyncio.sleep(2)
                 now = time.time()
-                # 1. Ringing timeout (45s)
                 if STATS.state == "RINGING" and STATS.ring_start_time:
                     if now - STATS.ring_start_time > RING_TIMEOUT_SEC:
-                        print(f"[watchdog] Call ringing timed out after {RING_TIMEOUT_SEC}s without answer -> auto-cancelling", flush=True)
+                        print(f"[watchdog] Ringing timed out after {RING_TIMEOUT_SEC}s -> auto-cancelling", flush=True)
                         self.on_button_hangup(notify_esp=True)
-                # 2. Maximum call duration watchdog (30 min)
                 elif STATS.state == "IN_CALL" and STATS.call_start_time:
                     dur = now - STATS.call_start_time
                     if dur > MAX_CALL_DURATION_SEC:
-                        print(f"[watchdog] Max call duration reached ({dur:.0f}s >= {MAX_CALL_DURATION_SEC}s) -> auto-hanging up to preserve quota", flush=True)
+                        print(f"[watchdog] Max call duration reached ({dur:.0f}s >= {MAX_CALL_DURATION_SEC}s) -> hanging up", flush=True)
                         self.on_button_hangup(notify_esp=True)
             except asyncio.CancelledError:
                 break
@@ -537,7 +564,7 @@ class TelephoneManager:
                 print(f"[watchdog] error: {e}", flush=True)
 
     def on_remote_empty(self):
-        print("[call] caller disconnected from LiveKit room -> releasing call lock", flush=True)
+        print("[call] caller disconnected from LiveKit room -> releasing lock", flush=True)
         self.on_button_hangup(notify_esp=True)
 
     async def start_call_session(self):
@@ -574,13 +601,12 @@ class TelephoneManager:
         STATS.call_start_time = None
         STATS.ring_start_time = None
         if notify_esp:
-            self.udp.send_call_end()
+            self.device_link.send_call_end()
         asyncio.create_task(self.stop_call_session())
 
-# ---------------------------------------------------------------- Native REST API
+# ---------------------------------------------------------------- Token Generator
 
 def generate_caller_token(caller_id: str):
-    """Generates a short-lived token strictly for the authenticated Android caller."""
     from livekit import api
     token = (api.AccessToken(LIVEKIT_KEY, LIVEKIT_SECRET)
              .with_identity(caller_id)
@@ -588,187 +614,178 @@ def generate_caller_token(caller_id: str):
              .to_jwt())
     return {"url": LIVEKIT_URL, "token": token, "room": ROOM_NAME}
 
-def make_json_response(status_code: int, status_text: str, data: dict, extra_headers: list = None) -> bytes:
-    body = json.dumps(data, indent=2).encode("utf-8")
-    hdrs = [
-        f"HTTP/1.1 {status_code} {status_text}",
-        "Content-Type: application/json; charset=utf-8",
-        f"Content-Length: {len(body)}",
-        "Access-Control-Allow-Origin: *",
-        "Access-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token",
-        "Access-Control-Allow-Methods: GET, POST, OPTIONS",
-        "Connection: close",
-    ]
-    if extra_headers:
-        hdrs.extend(extra_headers)
-    return ("\r\n".join(hdrs) + "\r\n\r\n").encode("utf-8") + body
+# ---------------------------------------------------------------- aiohttp Web Application
 
-async def run_http_server(mgr: TelephoneManager):
-    async def handler(reader, writer):
+def create_app(mgr: TelephoneManager) -> web.Application:
+    app = web.Application()
+
+    @web.middleware
+    async def cors_and_rate_middleware(request, handler):
+        if request.method == "OPTIONS":
+            return web.Response(
+                status=204,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Auth-Token",
+                    "Access-Control-Max-Age": "86400",
+                }
+            )
+
+        # Rate limiting
+        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.remote or "unknown"
+        is_call_op = request.path in ("/call/start", "/token")
+        allowed, limit_msg = RATE_LIMITER.check(client_ip, is_call_op=is_call_op)
+        if not allowed:
+            return web.json_response(
+                {"error": "too_many_requests", "detail": limit_msg},
+                status=429,
+                headers={"Retry-After": "60", "Access-Control-Allow-Origin": "*"}
+            )
+
         try:
-            req = await reader.read(4096)
-            if not req:
-                return
-
-            peername = writer.get_extra_info("peername")
-            client_ip = peername[0] if peername else "unknown"
-
-            raw_text = req.decode(errors="ignore")
-            lines = raw_text.split("\r\n")
-            first_line = lines[0].split(" ") if lines else []
-            method = first_line[0] if len(first_line) > 0 else "GET"
-            full_path = first_line[1] if len(first_line) > 1 else "/"
-
-            headers = {}
-            body_start = -1
-            for i, h in enumerate(lines[1:], 1):
-                if not h:
-                    body_start = i + 1
-                    break
-                if ":" in h:
-                    k, v = h.split(":", 1)
-                    headers[k.strip().lower()] = v.strip()
-
-            req_body_text = "\r\n".join(lines[body_start:]) if body_start != -1 else ""
-
-            if "x-forwarded-for" in headers:
-                client_ip = headers["x-forwarded-for"].split(",")[0].strip()
-
-            parsed_url = urlparse(full_path)
-            path = parsed_url.path
-            query_params = parse_qs(parsed_url.query)
-
-            # 1. CORS Preflight
-            if method == "OPTIONS":
-                resp = (
-                    b"HTTP/1.1 204 No Content\r\n"
-                    b"Access-Control-Allow-Origin: *\r\n"
-                    b"Access-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token\r\n"
-                    b"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                    b"Access-Control-Max-Age: 86400\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
-                writer.write(resp)
-                await writer.drain()
-                return
-
-            # 2. Rate Limiter
-            is_call_op = path in ("/call/start", "/token")
-            allowed, limit_msg = RATE_LIMITER.check(client_ip, is_call_op=is_call_op)
-            if not allowed:
-                resp = make_json_response(429, "Too Many Requests", {
-                    "error": "too_many_requests",
-                    "detail": limit_msg
-                }, ["Retry-After: 60"])
-                writer.write(resp)
-                await writer.drain()
-                return
-
-            # 3. Routes
-
-            # Health Check / Keepalive
-            if path == "/ping":
-                resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong"
-
-            # Device Availability (Single-Listener Status)
-            elif path in ("/status", "/devices"):
-                if not check_auth(headers, query_params):
-                    resp = make_json_response(401, "Unauthorized", {
-                        "error": "unauthorized",
-                        "detail": "Android application authentication token required"
-                    }, ["WWW-Authenticate: Bearer"])
-                else:
-                    data = [STATS.as_dict()] if path == "/devices" else STATS.as_dict()
-                    resp = make_json_response(200, "OK", data)
-
-            # Call Reservation & Initiation (Atomic Call Lock)
-            elif path == "/call/start":
-                if not check_auth(headers, query_params):
-                    resp = make_json_response(401, "Unauthorized", {
-                        "error": "unauthorized",
-                        "detail": "Android application authentication token required"
-                    }, ["WWW-Authenticate: Bearer"])
-                elif STATS.state in ("IN_CALL", "RINGING"):
-                    # Single-active-call policy: Lock held by another caller
-                    resp = make_json_response(486, "Busy Here", {
-                        "error": "busy",
-                        "detail": "ESP32 listener is currently on another call",
-                        "active_call_id": STATS.active_call_id,
-                        "active_caller_id": STATS.active_caller_id
-                    })
-                else:
-                    # Parse caller identity from Android request body
-                    caller_id = "android-caller"
-                    try:
-                        req_json = json.loads(req_body_text) if req_body_text else {}
-                        caller_id = req_json.get("caller_id", "android-caller")
-                    except Exception:
-                        pass
-
-                    call_id = f"call_{int(time.time())}_{caller_id}"
-                    print(f"[call] Reserved for caller '{caller_id}' (call_id={call_id})", flush=True)
-
-                    # Acquire atomic lock
-                    STATS.state = "RINGING"
-                    STATS.active_call_id = call_id
-                    STATS.active_caller_id = caller_id
-                    STATS.ring_start_time = time.time()
-
-                    # Trigger physical ESP32 ringing and start gateway session
-                    mgr.udp.ring_device()
-                    asyncio.create_task(mgr.start_call_session())
-
-                    # Issue short-lived credentials for the authorized Android caller
-                    cred = generate_caller_token(caller_id)
-                    resp = make_json_response(200, "OK", {
-                        "call_id": call_id,
-                        "caller_id": caller_id,
-                        "target_device": DEVICE_ID,
-                        "room": cred["room"],
-                        "livekit_url": cred["url"],
-                        "token": cred["token"],
-                        "expires_in": 3600
-                    })
-
-            # Call Termination
-            elif path in ("/call/end", "/hangup"):
-                if not check_auth(headers, query_params):
-                    resp = make_json_response(401, "Unauthorized", {
-                        "error": "unauthorized",
-                        "detail": "Android application authentication token required"
-                    }, ["WWW-Authenticate: Bearer"])
-                else:
-                    mgr.on_button_hangup()
-                    resp = make_json_response(200, "OK", {"status": "ended", "device": DEVICE_ID})
-
-            # Root & Unknown Routes -> API Service Info (NO WEB UI)
-            else:
-                resp = make_json_response(200, "OK", {
-                    "service": "esp-telephone-backend",
-                    "mode": "native-android-api-only",
-                    "version": "1.0.0",
-                    "device": DEVICE_ID,
-                    "status": "online"
-                })
-
-            writer.write(resp)
-            await writer.drain()
+            response = await handler(request)
+        except web.HTTPException as ex:
+            response = ex
         except Exception as e:
-            print(f"[http] error processing request: {e}", flush=True)
-            try:
-                err_resp = make_json_response(500, "Internal Server Error", {
-                    "error": "server_error",
-                    "detail": str(e)
-                })
-                writer.write(err_resp)
-                await writer.drain()
-            except Exception:
-                pass
-        finally:
-            writer.close()
+            print(f"[http] 500 error: {e}", flush=True)
+            response = web.json_response({"error": "server_error", "detail": str(e)}, status=500)
 
-    server = await asyncio.start_server(handler, "0.0.0.0", HTTP_PORT)
-    return server
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Auth-Token"
+        return response
+
+    app.middlewares.append(cors_and_rate_middleware)
+
+    # Routes
+    async def ping_handler(request):
+        return web.Response(text="pong")
+
+    async def status_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response(STATS.as_dict())
+
+    async def devices_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response([STATS.as_dict()])
+
+    async def call_start_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        if STATS.state in ("IN_CALL", "RINGING"):
+            return web.json_response({
+                "error": "busy",
+                "detail": "ESP32 listener is currently on another call",
+                "active_call_id": STATS.active_call_id,
+                "active_caller_id": STATS.active_caller_id
+            }, status=486)
+
+        caller_id = "android-caller"
+        try:
+            body = await request.json()
+            caller_id = body.get("caller_id", "android-caller")
+        except Exception:
+            pass
+
+        call_id = f"call_{int(time.time())}_{caller_id}"
+        print(f"[call] Reserved for caller '{caller_id}' (call_id={call_id})", flush=True)
+
+        STATS.state = "RINGING"
+        STATS.active_call_id = call_id
+        STATS.active_caller_id = caller_id
+        STATS.ring_start_time = time.time()
+
+        mgr.device_link.ring_device()
+        asyncio.create_task(mgr.start_call_session())
+
+        cred = generate_caller_token(caller_id)
+        return web.json_response({
+            "call_id": call_id,
+            "caller_id": caller_id,
+            "target_device": DEVICE_ID,
+            "room": cred["room"],
+            "livekit_url": cred["url"],
+            "token": cred["token"],
+            "expires_in": 3600
+        })
+
+    async def call_end_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        mgr.on_button_hangup()
+        return web.json_response({"status": "ended", "device": DEVICE_ID})
+
+    # Direct WebSocket Connection for ESP32 Hardware
+    async def esp32_ws_handler(request):
+        if not check_auth(request):
+            return web.Response(status=401, text="Unauthorized: invalid auth token")
+
+        ws = web.WebSocketResponse(heartbeat=15.0, max_msg_size=1024 * 64, tcp_nodelay=True)
+        await ws.prepare(request)
+        remote_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.remote or "unknown"
+        print(f"[ws] ESP32 hardware connected directly to cloud from {remote_ip}!", flush=True)
+
+        mgr.device_link.ws = ws
+        STATS.device_addr = (remote_ip, 443)
+        STATS.state = "IDLE"
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.BINARY:
+                    data = msg.data
+                    if not data:
+                        continue
+                    kind = data[0]
+                    if kind == PKT_AUDIO:
+                        pcm = data[1:]
+                        STATS.rx_bytes += len(pcm)
+                        STATS.rx_frames += 1
+                        STATS.rx_dbfs = compute_dbfs(pcm)
+                        mgr.on_device_audio(pcm)
+                    elif kind == PKT_CALL_ACCEPT:
+                        print("[ws] ESP32 physical button pressed: ACCEPT CALL", flush=True)
+                        mgr.on_button_accept()
+                    elif kind == PKT_CALL_END:
+                        print("[ws] ESP32 physical button pressed: HANG UP", flush=True)
+                        mgr.on_button_hangup(notify_esp=False)
+                    elif kind == PKT_PING:
+                        await ws.send_bytes(bytes([PKT_PONG]))
+                    elif kind == PKT_CONTROL:
+                        await ws.send_bytes(bytes([PKT_CONTROL]) + b"HERE")
+                elif msg.type == web.WSMsgType.ERROR:
+                    print(f"[ws] connection error: {ws.exception()}", flush=True)
+        finally:
+            print("[ws] ESP32 disconnected from cloud", flush=True)
+            if mgr.device_link.ws is ws:
+                mgr.device_link.ws = None
+                STATS.device_addr = None
+                if STATS.state != "IDLE":
+                    mgr.on_button_hangup(notify_esp=False)
+
+        return ws
+
+    async def root_handler(request):
+        return web.json_response({
+            "service": "esp-telephone-backend",
+            "mode": "native-android-api-only",
+            "version": "1.0.0",
+            "device": DEVICE_ID,
+            "status": "online"
+        })
+
+    app.router.add_get("/ping", ping_handler)
+    app.router.add_get("/status", status_handler)
+    app.router.add_get("/devices", devices_handler)
+    app.router.add_post("/call/start", call_start_handler)
+    app.router.add_post("/call/end", call_end_handler)
+    app.router.add_post("/hangup", call_end_handler)
+    app.router.add_get("/esp32/ws", esp32_ws_handler)
+    app.router.add_get("/", root_handler)
+
+    return app
 
 # ---------------------------------------------------------------- Entrypoint
 
@@ -779,9 +796,13 @@ async def main():
     STATS.state = "IDLE"
     print(f"[backend] ESP32 Internet Calling Gateway started on port {HTTP_PORT}", flush=True)
     print(f"[backend] Single-Listener Policy active (MAX_CALL_DURATION={MAX_CALL_DURATION_SEC}s, RING_TIMEOUT={RING_TIMEOUT_SEC}s)", flush=True)
-    print(f"[backend] Protected API (AUTH_TOKEN={'configured' if AUTH_TOKEN else 'disabled'}). No web calling permitted.", flush=True)
+    print(f"[backend] Direct WebSocket & REST API enabled at /esp32/ws and /call/*", flush=True)
 
-    http = await run_http_server(mgr)
+    app = create_app(mgr)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
+    await site.start()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -790,6 +811,7 @@ async def main():
 
     await stop_event.wait()
     print("[backend] shutting down...", flush=True)
+    await runner.cleanup()
     await mgr.livekit.stop()
     mgr.pacer.stop()
 
