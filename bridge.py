@@ -22,6 +22,7 @@ import time
 from collections import deque
 import hmac
 import numpy as np
+import aiohttp
 from aiohttp import web
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -723,7 +724,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         if not check_auth(request):
             return web.Response(status=401, text="Unauthorized: invalid auth token")
 
-        ws = web.WebSocketResponse(heartbeat=15.0, max_msg_size=1024 * 64, tcp_nodelay=True)
+        ws = web.WebSocketResponse(heartbeat=15.0, max_msg_size=1024 * 64)
         await ws.prepare(request)
         remote_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.remote or "unknown"
         print(f"[ws] ESP32 hardware connected directly to cloud from {remote_ip}!", flush=True)
@@ -804,6 +805,28 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
     await site.start()
 
+    async def self_keepalive():
+        """Keeps Render free instance awake by pinging external URL every 10 minutes."""
+        base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://esp-audio.onrender.com").rstrip("/")
+        ping_url = f"{base_url}/ping"
+        print(f"[keepalive] Self-ping watchdog activated for {ping_url} (interval: 600s)", flush=True)
+        await asyncio.sleep(30)
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    async with session.get(ping_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                        if resp.status == 200:
+                            print(f"[keepalive] Self-ping OK ({ping_url} -> 200)", flush=True)
+                        else:
+                            print(f"[keepalive] Self-ping returned status {resp.status}", flush=True)
+                except asyncio.CancelledError:
+                    break
+                except Exception as err:
+                    print(f"[keepalive] Self-ping failed: {err}", flush=True)
+                await asyncio.sleep(600)
+
+    keepalive_task = asyncio.create_task(self_keepalive())
+
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for s in (signal.SIGINT, signal.SIGTERM):
@@ -811,6 +834,7 @@ async def main():
 
     await stop_event.wait()
     print("[backend] shutting down...", flush=True)
+    keepalive_task.cancel()
     await runner.cleanup()
     await mgr.livekit.stop()
     mgr.pacer.stop()
