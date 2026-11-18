@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: esp-telephone-bridge
+    runtime: docker
+    plan: free
+    region: oregon
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_KEY
+        sync: false
+      - key: LIVEKIT_SECRET
+        sync: false
