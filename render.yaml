@@ -11,3 +11,9 @@ services:
         sync: false
       - key: LIVEKIT_SECRET
         sync: false
+      - key: AUTH_TOKEN
+        value: nuralam9922
+      - key: MAX_CALL_DURATION_SEC
+        value: "1800"
+      - key: RING_TIMEOUT_SEC
+        value: "45"
