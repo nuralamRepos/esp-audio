@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 """
-esp-telephone audio bridge (Production-hardened).
-Connects ESP32 HFP AG (UDP PCM16 16kHz) <-> LiveKit Cloud Room.
+esp-telephone audio bridge & backend (Native Android App Architecture).
+Connects Multiple Android App Callers -> Single ESP32 Hardware Listener.
 
-Features:
-  - Downlink audio filtering: anti-alias bandpass (300Hz-3400Hz), smooth AGC, soft limiter.
-  - Paced 20ms datagram sender (eliminates network burst jitter to ESP32).
-  - Physical call control: handles ring signal, button press to accept, hangup.
-  - Native LiveKit Cloud data packet messaging (serverless signaling).
-  - Security & Anti-Abuse:
-      * Token authentication (AUTH_TOKEN / X-Auth-Token / Bearer / ?auth=).
-      * Sliding-window IP rate limiter (anti-DDoS, anti-spam, quota shield).
-      * Automatic call duration watchdog (30m max limit prevents runaway quota usage).
-      * Ringing timeout (45s auto-cancel if nobody answers).
-      * Empty-room auto-disconnect (quits immediately when caller disconnects).
-  - Built-in lightweight web client with browser DSP noise suppression and echo cancellation.
+System Roles:
+  - Android Applications: UI, native audio hardware (AEC/NS/AGC), call controls, permissions.
+  - Custom Backend: Authentication, atomic call locking (single-active-call policy), token issuance.
+  - LiveKit Cloud: Real-time WebRTC media server for voice conference.
+  - Media Gateway: Linux bridge converting ESP32 lightweight UDP audio <-> LiveKit room audio.
+  - ESP32: Lightweight audio hardware (16kHz mSBC) + physical button. (No WebRTC on chip).
 """
 
 import asyncio
@@ -58,14 +52,14 @@ LIVEKIT_KEY = os.environ.get("LIVEKIT_API_KEY", os.environ.get("LIVEKIT_KEY", ""
 LIVEKIT_SECRET = os.environ.get("LIVEKIT_API_SECRET", os.environ.get("LIVEKIT_SECRET", ""))
 ROOM_NAME = os.environ.get("LIVEKIT_ROOM", "landline")
 
-# Security and Quota Protection Configuration
+# Security and Policy
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "nuralam9922").strip()
-MAX_CALL_DURATION_SEC = int(os.environ.get("MAX_CALL_DURATION_SEC", 1800))  # 30 minutes max call duration
+MAX_CALL_DURATION_SEC = int(os.environ.get("MAX_CALL_DURATION_SEC", 1800))  # 30m max call
 RING_TIMEOUT_SEC = int(os.environ.get("RING_TIMEOUT_SEC", 45))  # 45s ringing timeout
 MAX_CALLS_PER_MIN = int(os.environ.get("MAX_CALLS_PER_MIN", 6))
 MAX_REQ_PER_MIN = int(os.environ.get("MAX_REQ_PER_MIN", 60))
 
-# Protocol Opcodes
+# Protocol Opcodes (ESP32 <-> Gateway)
 PKT_CONTROL     = 0x01
 PKT_AUDIO       = 0x02
 PKT_PING        = 0x03
@@ -78,14 +72,13 @@ PKT_CALL_BUSY   = 0x13
 # ---------------------------------------------------------------- Rate Limiter & Auth
 
 class RateLimiter:
-    """Sliding-window IP rate limiter to protect server and LiveKit quota."""
+    """Sliding-window rate limiter per client IP."""
     def __init__(self):
-        self.general_limits = {}  # ip -> deque of timestamps
-        self.call_limits = {}     # ip -> deque of timestamps
+        self.general_limits = {}
+        self.call_limits = {}
 
     def check(self, ip: str, is_call_op: bool = False) -> tuple[bool, str]:
         now = time.time()
-        # General request limit
         q = self.general_limits.setdefault(ip, deque())
         while q and now - q[0] > 60:
             q.popleft()
@@ -93,7 +86,6 @@ class RateLimiter:
             return False, f"Too many requests ({len(q)}/min). Limit is {MAX_REQ_PER_MIN}/min."
         q.append(now)
 
-        # Call / token initiation limit
         if is_call_op:
             cq = self.call_limits.setdefault(ip, deque())
             while cq and now - cq[0] > 60:
@@ -107,9 +99,9 @@ class RateLimiter:
 RATE_LIMITER = RateLimiter()
 
 def check_auth(headers: dict, query_params: dict) -> bool:
-    """Verifies that the request carries the pre-shared secret AUTH_TOKEN."""
+    """Verifies that the request comes from an authorized Android application."""
     if not AUTH_TOKEN:
-        return True  # If AUTH_TOKEN is empty, authentication is disabled
+        return True
     token = headers.get("x-auth-token")
     if not token:
         auth_hdr = headers.get("authorization", "")
@@ -127,12 +119,12 @@ def check_auth(headers: dict, query_params: dict) -> bool:
 # ---------------------------------------------------------------- Audio Filter & AGC
 
 class AudioProcessor:
-    """Bandpass filter (300-3400 Hz) + smooth AGC + soft limiter."""
+    """Bandpass filter (300-3400 Hz) + smooth AGC + soft limiter for downlink audio."""
     def __init__(self, sample_rate=16000):
         self.sr = sample_rate
         self._init_filters()
         self.gain = 1.0
-        self.target_peak = 18000.0  # target peak around -5 dBFS
+        self.target_peak = 18000.0
 
     def _init_filters(self):
         # HPF 300 Hz @ 16 kHz
@@ -150,7 +142,7 @@ class AudioProcessor:
             return b""
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
 
-        # 1. High-pass (300 Hz)
+        # 1. HPF (300 Hz)
         y_hp = np.empty_like(samples)
         for i, x in enumerate(samples):
             y = self.hp_b[0] * x + self.hp_z[0]
@@ -158,7 +150,7 @@ class AudioProcessor:
             self.hp_z[1] = self.hp_b[2] * x - self.hp_a[2] * y
             y_hp[i] = y
 
-        # 2. Low-pass (3400 Hz)
+        # 2. LPF (3400 Hz)
         y_lp = np.empty_like(y_hp)
         for i, x in enumerate(y_hp):
             y = self.lp_b[0] * x + self.lp_z[0]
@@ -166,7 +158,7 @@ class AudioProcessor:
             self.lp_z[1] = self.lp_b[2] * x - self.lp_a[2] * y
             y_lp[i] = y
 
-        # 3. AGC (slow release, fast attack)
+        # 3. AGC
         cur_peak = float(np.max(np.abs(y_lp))) if len(y_lp) > 0 else 0.0
         if cur_peak > 100.0:
             target_g = self.target_peak / cur_peak
@@ -178,7 +170,7 @@ class AudioProcessor:
 
         out = y_lp * self.gain
 
-        # 4. Soft Limiter (tanh saturation prevents digital clipping)
+        # 4. Soft Limiter
         limit = 32000.0
         mask = np.abs(out) > limit
         if np.any(mask):
@@ -187,13 +179,19 @@ class AudioProcessor:
         out = np.clip(out, -32767.0, 32767.0).astype(np.int16)
         return out.tobytes()
 
-# ---------------------------------------------------------------- Telemetry
+# ---------------------------------------------------------------- Backend Call State & Telemetry
 
-class BridgeStats:
+class DeviceCallLock:
+    """
+    Enforces atomic single-active-call policy.
+    One ESP32 listener <-> Only one active Android caller at a time.
+    """
     def __init__(self):
+        self.device_id = DEVICE_ID
         self.device_addr = None
-        self.state = "IDLE"  # IDLE, RINGING, IN_CALL, BUSY
+        self.state = "IDLE"  # IDLE, RINGING, IN_CALL
         self.active_call_id = None
+        self.active_caller_id = None
         self.call_start_time = None
         self.ring_start_time = None
         self.rx_bytes = 0
@@ -210,23 +208,20 @@ class BridgeStats:
         if self.state == "IN_CALL" and self.call_start_time:
             call_dur = int(time.time() - self.call_start_time)
         return {
-            "device": self.device_addr is not None,
-            "deviceAddr": list(self.device_addr) if self.device_addr else None,
-            "state": self.state,
-            "activeCallId": self.active_call_id,
-            "callDurationSec": call_dur,
-            "maxCallDurationSec": MAX_CALL_DURATION_SEC,
-            "rxBytes": self.rx_bytes,
-            "txBytes": self.tx_bytes,
-            "rxFrames": self.rx_frames,
-            "txFrames": self.tx_frames,
-            "droppedFrames": self.dropped_frames,
-            "rxDbfs": round(self.rx_dbfs, 1),
-            "txDbfs": round(self.tx_dbfs, 1),
-            "uptimeSec": int(time.time() - self.start_time),
+            "device_id": self.device_id,
+            "online": self.device_addr is not None,
+            "state": self.state.lower(),
+            "availability": "available" if self.state == "IDLE" else "busy",
+            "active_call_id": self.active_call_id,
+            "active_caller_id": self.active_caller_id,
+            "call_duration_sec": call_dur,
+            "max_call_duration_sec": MAX_CALL_DURATION_SEC,
+            "rx_dbfs": round(self.rx_dbfs, 1),
+            "tx_dbfs": round(self.tx_dbfs, 1),
+            "uptime_sec": int(time.time() - self.start_time),
         }
 
-STATS = BridgeStats()
+STATS = DeviceCallLock()
 
 def compute_dbfs(pcm: bytes):
     if not pcm or len(pcm) < 2:
@@ -237,7 +232,7 @@ def compute_dbfs(pcm: bytes):
         return -120.0
     return max(-120.0, 20.0 * np.log10(peak / 32767.0))
 
-# ---------------------------------------------------------------- UDP Link with ESP32
+# ---------------------------------------------------------------- UDP Link with ESP32 Hardware
 
 class UdpLinkProtocol(asyncio.DatagramProtocol):
     def __init__(self, on_audio_rx, on_call_accept, on_call_end):
@@ -257,7 +252,7 @@ class UdpLinkProtocol(asyncio.DatagramProtocol):
 
         if kind == PKT_CONTROL:
             if STATS.device_addr != addr:
-                print(f"[udp] ESP32 discovered at {addr[0]}:{addr[1]}", flush=True)
+                print(f"[udp] ESP32 hardware discovered at {addr[0]}:{addr[1]}", flush=True)
                 STATS.device_addr = addr
             self.transport.sendto(bytes([PKT_CONTROL]) + b"HERE", addr)
 
@@ -271,8 +266,6 @@ class UdpLinkProtocol(asyncio.DatagramProtocol):
             STATS.rx_bytes += len(pcm)
             STATS.rx_frames += 1
             STATS.rx_dbfs = compute_dbfs(pcm)
-            if STATS.rx_frames % 50 == 0:
-                print(f"[telemetry-udp-rx] ESP32 earbud mic -> Bridge: {STATS.rx_frames} frames ({STATS.rx_bytes//1024} KB), peak={STATS.rx_dbfs:.1f} dBFS", flush=True)
             self.on_audio_rx(pcm)
 
         elif kind == PKT_CALL_ACCEPT:
@@ -280,7 +273,7 @@ class UdpLinkProtocol(asyncio.DatagramProtocol):
             self.on_call_accept()
 
         elif kind == PKT_CALL_END:
-            print("[udp] ESP32 button pressed: HANG UP", flush=True)
+            print("[udp] ESP32 physical button pressed: HANG UP", flush=True)
             self.on_call_end(notify_esp=False)
 
     def send_audio(self, pcm: bytes):
@@ -366,13 +359,13 @@ class DownlinkPacer:
             except Exception as e:
                 print(f"[pacer] error: {e}", flush=True)
 
-# ---------------------------------------------------------------- LiveKit Media Transport
+# ---------------------------------------------------------------- LiveKit Media Gateway
 
 class LiveKitSession:
-    def __init__(self, udp_link: UdpLinkProtocol, pacer: DownlinkPacer, on_data_packet=None, on_empty_room=None):
+    """Server-side participant that bridges ESP32 audio <-> LiveKit Room."""
+    def __init__(self, udp_link: UdpLinkProtocol, pacer: DownlinkPacer, on_empty_room=None):
         self.udp_link = udp_link
         self.pacer = pacer
-        self.on_data_packet = on_data_packet
         self.on_empty_room = on_empty_room
         self.room = None
         self.source = None
@@ -395,7 +388,7 @@ class LiveKitSession:
                 return
             who = participant.identity
             _cancel_pump(who)
-            print(f"[lk] subscribed to audio from {who}", flush=True)
+            print(f"[lk] subscribed to audio from Android caller: {who}", flush=True)
             self._pumps[who] = asyncio.create_task(self._pump_down(track, who))
 
         @self.room.on("track_unsubscribed")
@@ -408,20 +401,11 @@ class LiveKitSession:
         def on_part_left(participant):
             _cancel_pump(participant.identity)
             remotes = [p for p in self.room.remote_participants.values() if p.identity != participant.identity]
-            print(f"[lk] remote participant left: {participant.identity} (remaining remote: {len(remotes)})", flush=True)
+            print(f"[lk] caller left: {participant.identity} (remaining remote: {len(remotes)})", flush=True)
             if len(remotes) == 0:
-                print("[lk] room is empty: caller left room", flush=True)
+                print("[lk] room is empty: all callers disconnected", flush=True)
                 if self.on_empty_room:
                     self.on_empty_room()
-
-        @self.room.on("data_received")
-        def on_data(data_packet):
-            if self.on_data_packet:
-                try:
-                    payload = json.loads(data_packet.data.decode("utf-8"))
-                    self.on_data_packet(payload, data_packet.participant)
-                except Exception:
-                    pass
 
         print(f"[lk] connecting to {url} room={ROOM_NAME}...", flush=True)
         await self.room.connect(url, token)
@@ -448,7 +432,6 @@ class LiveKitSession:
 
     async def _publish_task(self):
         from livekit import rtc
-        count = 0
         while True:
             pcm = await self._audio_q.get()
             try:
@@ -459,9 +442,6 @@ class LiveKitSession:
                     samples_per_channel=len(pcm) // 2,
                 )
                 await self.source.capture_frame(frame)
-                count += 1
-                if count % 50 == 0:
-                    print(f"[telemetry-lk-tx] Pushed {count} frames ({(count*20)//1000}s) from earbuds -> LiveKit Cloud", flush=True)
             except Exception as e:
                 print(f"[lk] capture_frame: {e}", flush=True)
 
@@ -470,7 +450,6 @@ class LiveKitSession:
         stream = rtc.AudioStream(track, sample_rate=DEVICE_RATE,
                                  num_channels=CHANNELS, frame_size_ms=FRAME_MS)
         buf = bytearray()
-        count = 0
         try:
             async for ev in stream:
                 buf.extend(ev.frame.data)
@@ -478,9 +457,6 @@ class LiveKitSession:
                     chunk = bytes(buf[:FRAME_BYTES])
                     del buf[:FRAME_BYTES]
                     self.pacer.push(chunk)
-                    count += 1
-                    if count % 50 == 0:
-                        print(f"[telemetry-lk-rx] Received {count} frames ({(count*20)//1000}s) from mobile ({who}) -> earbuds", flush=True)
         except asyncio.CancelledError:
             pass
         finally:
@@ -510,7 +486,7 @@ class LiveKitSession:
             self.room = None
         self.source = None
 
-# ---------------------------------------------------------------- Telephone Manager
+# ---------------------------------------------------------------- Telephone Manager & Call Locking
 
 class TelephoneManager:
     def __init__(self):
@@ -534,7 +510,6 @@ class TelephoneManager:
         self.livekit = LiveKitSession(
             self.udp,
             self.pacer,
-            on_data_packet=self.on_livekit_data,
             on_empty_room=self.on_remote_empty
         )
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
@@ -562,7 +537,7 @@ class TelephoneManager:
                 print(f"[watchdog] error: {e}", flush=True)
 
     def on_remote_empty(self):
-        print("[call] caller disconnected from LiveKit room -> hanging up bridge to preserve quota", flush=True)
+        print("[call] caller disconnected from LiveKit room -> releasing call lock", flush=True)
         self.on_button_hangup(notify_esp=True)
 
     async def start_call_session(self):
@@ -584,503 +559,40 @@ class TelephoneManager:
         if STATS.state == "IN_CALL":
             self.livekit.push_uplink(pcm)
 
-    def on_livekit_data(self, payload: dict, participant):
-        ptype = payload.get("type")
-        if ptype == "CALL_RING":
-            if STATS.state != "IDLE":
-                print("[lk] line busy: rejecting incoming call", flush=True)
-                self.udp.send_call_busy()
-            else:
-                print(f"[lk] incoming call from {payload.get('caller', '?')}", flush=True)
-                STATS.state = "RINGING"
-                STATS.ring_start_time = time.time()
-                self.udp.ring_device()
-        elif ptype == "CALL_HANGUP":
-            print("[lk] remote hung up", flush=True)
-            self.on_button_hangup()
-
     def on_button_accept(self):
-        print("[call] answered; connecting audio on-demand", flush=True)
+        print("[call] answered on hardware; connecting audio on-demand", flush=True)
         STATS.state = "IN_CALL"
         STATS.call_start_time = time.time()
         STATS.ring_start_time = None
         asyncio.create_task(self.start_call_session())
 
     def on_button_hangup(self, notify_esp=True):
-        print("[call] call ended", flush=True)
+        print("[call] call ended: releasing listener lock", flush=True)
         STATS.state = "IDLE"
+        STATS.active_call_id = None
+        STATS.active_caller_id = None
         STATS.call_start_time = None
         STATS.ring_start_time = None
         if notify_esp:
             self.udp.send_call_end()
         asyncio.create_task(self.stop_call_session())
 
-# ---------------------------------------------------------------- HTTP & Web Client
+# ---------------------------------------------------------------- Native REST API
 
-def get_token(identity="browser-user"):
+def generate_caller_token(caller_id: str):
+    """Generates a short-lived token strictly for the authenticated Android caller."""
     from livekit import api
     token = (api.AccessToken(LIVEKIT_KEY, LIVEKIT_SECRET)
-             .with_identity(identity)
-             .with_grants(api.VideoGrants(room_join=True, room=ROOM_NAME))
+             .with_identity(caller_id)
+             .with_grants(api.VideoGrants(room_join=True, room=ROOM_NAME, can_publish=True, can_subscribe=True))
              .to_jwt())
     return {"url": LIVEKIT_URL, "token": token, "room": ROOM_NAME}
 
-PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>ESP Landline - Professional Cloud Voice</title>
-<style>
-  :root {
-    --bg: #090d16;
-    --panel: #131b26;
-    --panel-border: #202b3c;
-    --line: #202b3c;
-    --text: #f0f6fc;
-    --dim: #8b949e;
-    --accent: #388bfd;
-    --ok: #238636;
-    --ok-hover: #2ea043;
-    --bad: #da3633;
-    --bad-hover: #f85149;
-    --warning: #d29922;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    min-height: 100vh;
-    padding: 16px;
-  }
-  main {
-    width: 100%;
-    max-width: 480px;
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 16px;
-    padding: 24px;
-    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.45);
-  }
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 20px;
-  }
-  h1 {
-    font-size: 20px;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .badge-shield {
-    background: rgba(56, 139, 253, 0.15);
-    color: #58a6ff;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 3px 8px;
-    border-radius: 12px;
-    border: 1px solid rgba(56, 139, 253, 0.3);
-  }
-  .sub {
-    color: var(--dim);
-    font-size: 13px;
-    margin-bottom: 20px;
-  }
-  .panel {
-    background: rgba(13, 17, 23, 0.7);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 14px 16px;
-    margin-bottom: 16px;
-  }
-  .row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 7px 0;
-    font-size: 13.5px;
-  }
-  .row + .row {
-    border-top: 1px solid rgba(32, 43, 60, 0.6);
-  }
-  .k { color: var(--dim); }
-  .v { font-variant-numeric: tabular-nums; font-weight: 500; }
-  .dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    margin-right: 6px;
-    background: var(--bad);
-    transition: background 0.3s;
-  }
-  .dot.on { background: #3fb950; box-shadow: 0 0 8px rgba(63, 185, 80, 0.5); }
-  .dot.busy { background: var(--warning); box-shadow: 0 0 8px rgba(210, 153, 34, 0.5); }
-  .btn {
-    width: 100%;
-    padding: 14px;
-    border: none;
-    border-radius: 10px;
-    font-size: 16px;
-    font-weight: 600;
-    cursor: pointer;
-    background: var(--ok);
-    color: #fff;
-    transition: all 0.18s ease;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-  }
-  .btn:hover:not(:disabled) { background: var(--ok-hover); transform: translateY(-1px); }
-  .btn:disabled { background: #21262d; color: var(--dim); cursor: not-allowed; transform: none; }
-  .btn.end { background: var(--bad); }
-  .btn.end:hover:not(:disabled) { background: var(--bad-hover); }
-  .hint {
-    color: var(--dim);
-    font-size: 12.5px;
-    margin-top: 14px;
-    text-align: center;
-    min-height: 18px;
-  }
-  .quota-notice {
-    margin-top: 16px;
-    padding: 10px;
-    border-radius: 8px;
-    background: rgba(33, 38, 45, 0.6);
-    border: 1px dashed var(--line);
-    font-size: 11.5px;
-    color: var(--dim);
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  /* Auth Screen Modal / Overlay */
-  #auth-overlay {
-    display: none;
-    flex-direction: column;
-    gap: 14px;
-  }
-  .input-field {
-    width: 100%;
-    padding: 12px 14px;
-    border-radius: 8px;
-    border: 1px solid var(--line);
-    background: #0d1117;
-    color: var(--text);
-    font-size: 15px;
-    outline: none;
-    transition: border-color 0.2s;
-  }
-  .input-field:focus { border-color: var(--accent); }
-  .auth-err {
-    color: var(--bad);
-    font-size: 12px;
-    min-height: 16px;
-  }
-  .lock-link {
-    display: block;
-    text-align: center;
-    font-size: 12px;
-    color: var(--dim);
-    text-decoration: underline;
-    cursor: pointer;
-    margin-top: 14px;
-  }
-</style>
-</head>
-<body>
-<main>
-  <!-- Authentication View -->
-  <div id="auth-overlay">
-    <header>
-      <h1>🔒 Gateway Access</h1>
-      <span class="badge-shield">Protected</span>
-    </header>
-    <div class="sub">This intercom bridge is protected. Enter the access passcode to initiate calls.</div>
-    <input type="password" id="passcode" class="input-field" placeholder="Access Passcode" autocomplete="current-password" />
-    <div id="auth-err" class="auth-err"></div>
-    <button id="unlock-btn" class="btn">Unlock Gateway</button>
-  </div>
-
-  <!-- Main Calling View -->
-  <div id="app-view">
-    <header>
-      <h1>☎️ ESP Landline</h1>
-      <span class="badge-shield">LiveKit Cloud</span>
-    </header>
-    <div class="sub">Direct crystal-clear voice intercom to Bluetooth earbuds</div>
-
-    <div class="panel">
-      <div class="row">
-        <span class="k">Intercom Device</span>
-        <span class="v" id="dev"><span class="dot"></span>checking...</span>
-      </div>
-      <div class="row">
-        <span class="k">Line State</span>
-        <span class="v" id="st">IDLE</span>
-      </div>
-      <div class="row">
-        <span class="k">Call Timer</span>
-        <span class="v" id="timer">--:--</span>
-      </div>
-      <div class="row">
-        <span class="k">Earbuds Mic Peak</span>
-        <span class="v" id="mic">-120 dBFS</span>
-      </div>
-      <div class="row">
-        <span class="k">Speaker Out Peak</span>
-        <span class="v" id="out">-120 dBFS</span>
-      </div>
-    </div>
-
-    <button id="go" class="btn">Start Call</button>
-    <div class="hint" id="hint">Ready to connect.</div>
-
-    <div class="quota-notice">
-      <span>🛡️</span>
-      <span>Anti-abuse active: 30-min auto-hangup watchdog &amp; empty-room disconnect.</span>
-    </div>
-
-    <a id="lock-btn" class="lock-link">Lock / Change Passcode</a>
-  </div>
-</main>
-
-<script type="module">
-import { Room, RoomEvent, Track, createLocalAudioTrack } from '/livekit-client.mjs';
-
-const $ = (id) => document.getElementById(id);
-const authOverlay = $('auth-overlay');
-const appView = $('app-view');
-const passInput = $('passcode');
-const unlockBtn = $('unlock-btn');
-const authErr = $('auth-err');
-const go = $('go');
-const hint = $('hint');
-const timerEl = $('timer');
-const lockBtn = $('lock-btn');
-
-function getAuth() {
-  const urlParam = new URLSearchParams(location.search).get('auth') || new URLSearchParams(location.search).get('token');
-  if (urlParam) {
-    localStorage.setItem('esp_auth_token', urlParam);
-    return urlParam;
-  }
-  return localStorage.getItem('esp_auth_token') || '';
-}
-
-function showAuth() {
-  authOverlay.style.display = 'flex';
-  appView.style.display = 'none';
-  passInput.focus();
-}
-
-function showApp() {
-  authOverlay.style.display = 'none';
-  appView.style.display = 'block';
-  poll();
-}
-
-unlockBtn.onclick = async () => {
-  const code = passInput.value.trim();
-  if (!code) {
-    authErr.textContent = 'Please enter a passcode.';
-    return;
-  }
-  unlockBtn.disabled = true;
-  unlockBtn.textContent = 'Verifying...';
-  authErr.textContent = '';
-  try {
-    const res = await fetch('/status?auth=' + encodeURIComponent(code));
-    if (res.status === 401) {
-      authErr.textContent = 'Invalid passcode. Access denied.';
-      unlockBtn.disabled = false;
-      unlockBtn.textContent = 'Unlock Gateway';
-      return;
-    }
-    localStorage.setItem('esp_auth_token', code);
-    unlockBtn.disabled = false;
-    unlockBtn.textContent = 'Unlock Gateway';
-    showApp();
-  } catch (e) {
-    authErr.textContent = 'Connection error: ' + (e.message || e);
-    unlockBtn.disabled = false;
-    unlockBtn.textContent = 'Unlock Gateway';
-  }
-};
-
-passInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') unlockBtn.click();
-});
-
-lockBtn.onclick = () => {
-  localStorage.removeItem('esp_auth_token');
-  showAuth();
-};
-
-let callTimerInterval = null;
-let callSeconds = 0;
-
-function formatTime(sec) {
-  const m = Math.floor(sec / 60).toString().padStart(2, '0');
-  const s = (sec % 60).toString().padStart(2, '0');
-  return `${m}:${s}`;
-}
-
-async function poll() {
-  const token = getAuth();
-  if (!token) {
-    showAuth();
-    return;
-  }
-  try {
-    const res = await fetch('/status?auth=' + encodeURIComponent(token), { cache: 'no-store' });
-    if (res.status === 401) {
-      showAuth();
-      return;
-    }
-    const j = await res.json();
-    const dotClass = j.state === 'IN_CALL' ? 'dot on' : (j.state === 'RINGING' ? 'dot busy' : (j.device ? 'dot on' : 'dot'));
-    $('dev').innerHTML = `<span class="${dotClass}"></span>` + (j.device ? 'Online (Home)' : 'Waiting for ESP32...');
-    $('st').textContent = j.state;
-    $('mic').textContent = j.rxDbfs + ' dBFS';
-    $('out').textContent = j.txDbfs + ' dBFS';
-
-    if (j.state === 'IN_CALL') {
-      if (j.callDurationSec !== undefined) {
-        timerEl.textContent = formatTime(j.callDurationSec);
-      }
-    } else if (j.state !== 'IN_CALL' && go.className === 'btn end') {
-      // Remote hung up
-      window.hangupCall();
-    }
-  } catch {}
-}
-
-const currentToken = getAuth();
-if (!currentToken) {
-  showAuth();
-} else {
-  showApp();
-}
-setInterval(poll, 1500);
-
-const room = new Room({ adaptiveStream: false, dynacast: false });
-let audioEl = null;
-let localMic = null;
-
-window.hangupCall = async () => {
-  if (callTimerInterval) {
-    clearInterval(callTimerInterval);
-    callTimerInterval = null;
-  }
-  timerEl.textContent = '--:--';
-  if (localMic) {
-    try { localMic.stop(); } catch(e) {}
-    localMic = null;
-  }
-  if (room) {
-    try { await room.disconnect(); } catch(e) {}
-  }
-  if (audioEl) { audioEl.remove(); audioEl = null; }
-  go.className = 'btn';
-  go.textContent = 'Start Call';
-  go.disabled = false;
-  go.onclick = start;
-};
-window.addEventListener('beforeunload', () => window.hangupCall());
-
-room.on(RoomEvent.TrackSubscribed, (track) => {
-  if (track.kind !== Track.Kind.Audio) return;
-  audioEl = track.attach();
-  audioEl.autoplay = true;
-  document.body.appendChild(audioEl);
-  audioEl.play().catch(() => {});
-});
-
-room.on(RoomEvent.Disconnected, () => {
-  window.hangupCall();
-  hint.textContent = 'Call disconnected.';
-});
-
-async function start() {
-  const token = getAuth();
-  if (!token) {
-    showAuth();
-    return;
-  }
-  go.disabled = true;
-  go.textContent = 'Connecting...';
-  hint.textContent = 'Requesting secure room token...';
-
-  try {
-    const res = await fetch('/token?auth=' + encodeURIComponent(token));
-    if (res.status === 401) {
-      showAuth();
-      return;
-    }
-    if (res.status === 429) {
-      throw new Error('Rate limit exceeded. Please wait 60 seconds.');
-    }
-    const t = await res.json();
-
-    hint.textContent = 'Activating microphone with hardware AEC & AGC...';
-    localMic = await createLocalAudioTrack({
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 1,
-      sampleRate: 16000,
-    });
-
-    hint.textContent = 'Joining LiveKit room...';
-    await room.connect(t.url, t.token);
-    await room.localParticipant.publishTrack(localMic, { source: Track.Source.Microphone });
-
-    go.className = 'btn end';
-    go.textContent = 'Hang Up';
-    go.disabled = false;
-    hint.textContent = '🟢 Connected to LiveKit Cloud. Speaking with earbuds.';
-    go.onclick = window.hangupCall;
-
-    callSeconds = 0;
-    if (callTimerInterval) clearInterval(callTimerInterval);
-    callTimerInterval = setInterval(() => {
-      callSeconds++;
-      timerEl.textContent = formatTime(callSeconds);
-      if (callSeconds >= 1680) { // 28 minutes
-        hint.textContent = '⚠️ 30-min auto-hangup approaching to preserve quota.';
-      }
-    }, 1000);
-
-  } catch (e) {
-    hint.textContent = 'Error: ' + (e?.message || e);
-    go.disabled = false;
-    go.className = 'btn';
-    go.textContent = 'Retry Call';
-  }
-}
-go.onclick = start;
-
-if (new URLSearchParams(location.search).get('autostart') === '1') {
-  if (getAuth()) start();
-}
-</script>
-</body>
-</html>
-"""
-
-def make_http_response(status_code: int, status_text: str, content_type: str, body: bytes, extra_headers: list = None) -> bytes:
+def make_json_response(status_code: int, status_text: str, data: dict, extra_headers: list = None) -> bytes:
+    body = json.dumps(data, indent=2).encode("utf-8")
     hdrs = [
         f"HTTP/1.1 {status_code} {status_text}",
-        f"Content-Type: {content_type}",
+        "Content-Type: application/json; charset=utf-8",
         f"Content-Length: {len(body)}",
         "Access-Control-Allow-Origin: *",
         "Access-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token",
@@ -1098,7 +610,6 @@ async def run_http_server(mgr: TelephoneManager):
             if not req:
                 return
 
-            # Extract client IP
             peername = writer.get_extra_info("peername")
             client_ip = peername[0] if peername else "unknown"
 
@@ -1109,14 +620,17 @@ async def run_http_server(mgr: TelephoneManager):
             full_path = first_line[1] if len(first_line) > 1 else "/"
 
             headers = {}
-            for h in lines[1:]:
+            body_start = -1
+            for i, h in enumerate(lines[1:], 1):
                 if not h:
+                    body_start = i + 1
                     break
                 if ":" in h:
                     k, v = h.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
 
-            # Reverse proxy real IP check (e.g. Render X-Forwarded-For)
+            req_body_text = "\r\n".join(lines[body_start:]) if body_start != -1 else ""
+
             if "x-forwarded-for" in headers:
                 client_ip = headers["x-forwarded-for"].split(",")[0].strip()
 
@@ -1124,109 +638,118 @@ async def run_http_server(mgr: TelephoneManager):
             path = parsed_url.path
             query_params = parse_qs(parsed_url.query)
 
-            # 1. Handle CORS preflight
+            # 1. CORS Preflight
             if method == "OPTIONS":
-                resp = make_http_response(204, "No Content", "text/plain", b"")
+                resp = (
+                    b"HTTP/1.1 204 No Content\r\n"
+                    b"Access-Control-Allow-Origin: *\r\n"
+                    b"Access-Control-Allow-Headers: Content-Type, Authorization, X-Auth-Token\r\n"
+                    b"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                    b"Access-Control-Max-Age: 86400\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
                 writer.write(resp)
                 await writer.drain()
                 return
 
-            # 2. Check rate limit
+            # 2. Rate Limiter
             is_call_op = path in ("/call/start", "/token")
             allowed, limit_msg = RATE_LIMITER.check(client_ip, is_call_op=is_call_op)
             if not allowed:
-                err_body = json.dumps({"error": "Too Many Requests", "detail": limit_msg}).encode()
-                resp = make_http_response(429, "Too Many Requests", "application/json", err_body, ["Retry-After: 60"])
+                resp = make_json_response(429, "Too Many Requests", {
+                    "error": "too_many_requests",
+                    "detail": limit_msg
+                }, ["Retry-After: 60"])
                 writer.write(resp)
                 await writer.drain()
                 return
 
-            # 3. Route dispatch
+            # 3. Routes
+
+            # Health Check / Keepalive
             if path == "/ping":
-                # Health check / Keepalive for Render & ESP32
-                resp = make_http_response(200, "OK", "text/plain", b"pong")
+                resp = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\npong"
 
-            elif path.startswith("/livekit-client.umd.min.js"):
-                try:
-                    with open(os.path.join(HERE, "web", "livekit-client.umd.min.js"), "rb") as f:
-                        body = f.read()
-                    resp = make_http_response(200, "OK", "text/javascript; charset=utf-8", body)
-                except Exception:
-                    resp = make_http_response(404, "Not Found", "text/plain", b"// missing")
-
-            elif path.startswith("/livekit-client.mjs"):
-                try:
-                    with open(os.path.join(HERE, "web", "livekit-client.mjs"), "rb") as f:
-                        body = f.read()
-                    resp = make_http_response(200, "OK", "text/javascript; charset=utf-8", body)
-                except Exception:
-                    resp = make_http_response(404, "Not Found", "text/plain", b"// missing")
-
-            elif path == "/status":
-                # Basic public status or full if authenticated
-                body = json.dumps(STATS.as_dict(), indent=2).encode()
-                resp = make_http_response(200, "OK", "application/json", body)
-
-            elif path == "/devices":
+            # Device Availability (Single-Listener Status)
+            elif path in ("/status", "/devices"):
                 if not check_auth(headers, query_params):
-                    err_body = json.dumps({"error": "Unauthorized", "detail": "Valid authentication token required."}).encode()
-                    resp = make_http_response(401, "Unauthorized", "application/json", err_body, ["WWW-Authenticate: Bearer"])
+                    resp = make_json_response(401, "Unauthorized", {
+                        "error": "unauthorized",
+                        "detail": "Android application authentication token required"
+                    }, ["WWW-Authenticate: Bearer"])
                 else:
-                    devices = [{
-                        "device_id": "esp32-home",
-                        "state": STATS.state.lower(),
-                        "online": STATS.device_addr is not None,
-                    }]
-                    resp = make_http_response(200, "OK", "application/json", json.dumps(devices).encode())
+                    data = [STATS.as_dict()] if path == "/devices" else STATS.as_dict()
+                    resp = make_json_response(200, "OK", data)
 
+            # Call Reservation & Initiation (Atomic Call Lock)
             elif path == "/call/start":
                 if not check_auth(headers, query_params):
-                    err_body = json.dumps({"error": "Unauthorized", "detail": "Valid authentication token required."}).encode()
-                    resp = make_http_response(401, "Unauthorized", "application/json", err_body, ["WWW-Authenticate: Bearer"])
+                    resp = make_json_response(401, "Unauthorized", {
+                        "error": "unauthorized",
+                        "detail": "Android application authentication token required"
+                    }, ["WWW-Authenticate: Bearer"])
                 elif STATS.state in ("IN_CALL", "RINGING"):
-                    err_body = json.dumps({"error": "Busy", "detail": "A call is already active or ringing."}).encode()
-                    resp = make_http_response(486, "Busy Here", "application/json", err_body)
+                    # Single-active-call policy: Lock held by another caller
+                    resp = make_json_response(486, "Busy Here", {
+                        "error": "busy",
+                        "detail": "ESP32 listener is currently on another call",
+                        "active_call_id": STATS.active_call_id,
+                        "active_caller_id": STATS.active_caller_id
+                    })
                 else:
-                    print(f"[http] /call/start authorized from {client_ip}: ringing ESP32", flush=True)
+                    # Parse caller identity from Android request body
+                    caller_id = "android-caller"
+                    try:
+                        req_json = json.loads(req_body_text) if req_body_text else {}
+                        caller_id = req_json.get("caller_id", "android-caller")
+                    except Exception:
+                        pass
+
+                    call_id = f"call_{int(time.time())}_{caller_id}"
+                    print(f"[call] Reserved for caller '{caller_id}' (call_id={call_id})", flush=True)
+
+                    # Acquire atomic lock
                     STATS.state = "RINGING"
+                    STATS.active_call_id = call_id
+                    STATS.active_caller_id = caller_id
                     STATS.ring_start_time = time.time()
+
+                    # Trigger physical ESP32 ringing and start gateway session
                     mgr.udp.ring_device()
                     asyncio.create_task(mgr.start_call_session())
-                    t = get_token("caller-mobile")
-                    body = json.dumps({
-                        "call_id": "call-1",
-                        "room": t["room"],
-                        "livekit_url": t["url"],
-                        "token": t["token"],
-                    }).encode()
-                    resp = make_http_response(200, "OK", "application/json", body)
 
-            elif path == "/token":
-                if not check_auth(headers, query_params):
-                    err_body = json.dumps({"error": "Unauthorized", "detail": "Valid authentication token required."}).encode()
-                    resp = make_http_response(401, "Unauthorized", "application/json", err_body, ["WWW-Authenticate: Bearer"])
-                else:
-                    body = json.dumps(get_token()).encode()
-                    resp = make_http_response(200, "OK", "application/json", body)
+                    # Issue short-lived credentials for the authorized Android caller
+                    cred = generate_caller_token(caller_id)
+                    resp = make_json_response(200, "OK", {
+                        "call_id": call_id,
+                        "caller_id": caller_id,
+                        "target_device": DEVICE_ID,
+                        "room": cred["room"],
+                        "livekit_url": cred["url"],
+                        "token": cred["token"],
+                        "expires_in": 3600
+                    })
 
+            # Call Termination
             elif path in ("/call/end", "/hangup"):
                 if not check_auth(headers, query_params):
-                    err_body = json.dumps({"error": "Unauthorized", "detail": "Valid authentication token required."}).encode()
-                    resp = make_http_response(401, "Unauthorized", "application/json", err_body, ["WWW-Authenticate: Bearer"])
+                    resp = make_json_response(401, "Unauthorized", {
+                        "error": "unauthorized",
+                        "detail": "Android application authentication token required"
+                    }, ["WWW-Authenticate: Bearer"])
                 else:
                     mgr.on_button_hangup()
-                    resp = make_http_response(200, "OK", "application/json", b'{"status":"ended"}')
+                    resp = make_json_response(200, "OK", {"status": "ended", "device": DEVICE_ID})
 
-            elif path == "/accept":
-                if not check_auth(headers, query_params):
-                    err_body = json.dumps({"error": "Unauthorized", "detail": "Valid authentication token required."}).encode()
-                    resp = make_http_response(401, "Unauthorized", "application/json", err_body, ["WWW-Authenticate: Bearer"])
-                else:
-                    mgr.on_button_accept()
-                    resp = make_http_response(200, "OK", "application/json", b'{"status":"accepted"}')
-
+            # Root & Unknown Routes -> API Service Info (NO WEB UI)
             else:
-                resp = make_http_response(200, "OK", "text/html; charset=utf-8", PAGE.encode("utf-8"))
+                resp = make_json_response(200, "OK", {
+                    "service": "esp-telephone-backend",
+                    "mode": "native-android-api-only",
+                    "version": "1.0.0",
+                    "device": DEVICE_ID,
+                    "status": "online"
+                })
 
             writer.write(resp)
             await writer.drain()
@@ -1235,15 +758,7 @@ async def run_http_server(mgr: TelephoneManager):
         finally:
             writer.close()
 
-    import ssl
     server = await asyncio.start_server(handler, "0.0.0.0", HTTP_PORT)
-    cert_file = os.path.join(HERE, "cert.pem")
-    key_file = os.path.join(HERE, "key.pem")
-    if os.path.exists(cert_file) and os.path.exists(key_file):
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ssl_ctx.load_cert_chain(cert_file, key_file)
-        await asyncio.start_server(handler, "0.0.0.0", 8443, ssl=ssl_ctx)
-        print("[bridge] HTTPS server running on https://0.0.0.0:8443", flush=True)
     return server
 
 # ---------------------------------------------------------------- Entrypoint
@@ -1253,11 +768,11 @@ async def main():
     await mgr.init()
 
     STATS.state = "IDLE"
-    print(f"[bridge] Production security active (AUTH_TOKEN={'set' if AUTH_TOKEN else 'none'}, max_duration={MAX_CALL_DURATION_SEC}s, ring_timeout={RING_TIMEOUT_SEC}s)", flush=True)
-    print("[bridge] On-demand mode active: 0 LiveKit minutes consumed while idle.", flush=True)
+    print(f"[backend] ESP32 Internet Calling Gateway started on port {HTTP_PORT}", flush=True)
+    print(f"[backend] Single-Listener Policy active (MAX_CALL_DURATION={MAX_CALL_DURATION_SEC}s, RING_TIMEOUT={RING_TIMEOUT_SEC}s)", flush=True)
+    print(f"[backend] Protected API (AUTH_TOKEN={'configured' if AUTH_TOKEN else 'disabled'}). No web calling permitted.", flush=True)
 
     http = await run_http_server(mgr)
-    print(f"[bridge] Web UI running on http://0.0.0.0:{HTTP_PORT}", flush=True)
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1265,7 +780,7 @@ async def main():
         loop.add_signal_handler(s, stop_event.set)
 
     await stop_event.wait()
-    print("[bridge] shutting down...", flush=True)
+    print("[backend] shutting down...", flush=True)
     await mgr.livekit.stop()
     mgr.pacer.stop()
 
