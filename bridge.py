@@ -47,9 +47,9 @@ UDP_PORT = int(os.environ.get("UDP_PORT", 8081))
 HTTP_PORT = int(os.environ.get("PORT", os.environ.get("HTTP_PORT", 8080)))
 DEVICE_ID = os.environ.get("DEVICE_ID", "esp32-home")
 
-LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "")
-LIVEKIT_KEY = os.environ.get("LIVEKIT_API_KEY", os.environ.get("LIVEKIT_KEY", ""))
-LIVEKIT_SECRET = os.environ.get("LIVEKIT_API_SECRET", os.environ.get("LIVEKIT_SECRET", ""))
+LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "wss://esp-audio-telephone-6w0f0mw5.livekit.cloud")
+LIVEKIT_KEY = os.environ.get("LIVEKIT_API_KEY", os.environ.get("LIVEKIT_KEY", "API7RGzY8gPJzUh"))
+LIVEKIT_SECRET = os.environ.get("LIVEKIT_API_SECRET", os.environ.get("LIVEKIT_SECRET", "39eygVhnkYtXPhW93JZKPVufdN6ozvBLGzCXwSenrjOA"))
 ROOM_NAME = os.environ.get("LIVEKIT_ROOM", "landline")
 
 # Security and Policy
@@ -755,6 +755,15 @@ async def run_http_server(mgr: TelephoneManager):
             await writer.drain()
         except Exception as e:
             print(f"[http] error processing request: {e}", flush=True)
+            try:
+                err_resp = make_json_response(500, "Internal Server Error", {
+                    "error": "server_error",
+                    "detail": str(e)
+                })
+                writer.write(err_resp)
+                await writer.drain()
+            except Exception:
+                pass
         finally:
             writer.close()
 
