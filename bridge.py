@@ -186,7 +186,16 @@ class AudioProcessor:
         self.sr = sample_rate
         self._init_filters()
         self.gain = 1.0
-        self.target_peak = 18000.0
+        # 18000 was 55% of full scale (-5.2 dBFS), so even a perfectly healthy
+        # call arrived at the earbuds already 5 dB down. Combined with the
+        # bandpass loss and the earbud's own ceiling that is the "sound is low"
+        # symptom. 28000 is 85% (-1.4 dBFS): as loud as the link can carry
+        # without the soft limiter working on every peak.
+        #
+        # This is the only remaining gain stage. The ESP32 already runs the HFP
+        # speaker volume at 15/15, which is the protocol maximum, and the PCM is
+        # passed through untouched between here and SCO.
+        self.target_peak = 28000.0
 
     def _init_filters(self):
         self.hp_b = np.array([0.92006, -1.84013, 0.92006], dtype=np.float32)
@@ -223,7 +232,7 @@ class AudioProcessor:
                 self.gain = 0.8 * self.gain + 0.2 * target_g
             else:
                 self.gain = 0.995 * self.gain + 0.005 * target_g
-            self.gain = max(0.2, min(self.gain, 3.5))
+            self.gain = max(0.2, min(self.gain, 6.0))
 
         out = y_lp * self.gain
 
