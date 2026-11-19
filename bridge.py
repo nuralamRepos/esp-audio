@@ -732,7 +732,8 @@ class DownlinkPacer:
                 try:
                     chunk = self.queue.get_nowait()
                 except asyncio.QueueEmpty:
-                    if STATS.state == "IN_CALL" and not STATS.is_on_hold:
+                    # Silence fill only while a call is actually up.
+                    if STATS.state in ("IN_CALL", "ON_HOLD") and not STATS.is_on_hold:
                         chunk = b"\x00" * FRAME_BYTES
                     else:
                         continue
@@ -792,8 +793,23 @@ class LiveKitSession:
             _cancel_pump(participant.identity)
             remotes = [p for p in self.room.remote_participants.values() if p.identity != participant.identity]
             print(f"[lk] caller left: {participant.identity} (remaining remote: {len(remotes)})", flush=True)
+
+            # AN EMPTY ROOM IS NOT A HUNG-UP CALL.
+            #
+            # This fired the moment the bridge joined the room on an outgoing
+            # call, because the bridge connects BEFORE the phone has finished
+            # joining - so "zero remote participants" was true by construction,
+            # and on_remote_empty() tore the ring down about 200 ms after it
+            # started. That is why a call rang briefly and then vanished, and why
+            # the second attempt died in "a split second".
+            #
+            # Only a caller leaving WHILE a call exists can end anything. During
+            # a ring nobody has necessarily joined yet; the ring timeout is what
+            # ends that, and it is owned by the watchdog.
+            if STATS.state in ("IDLE", "RINGING"):
+                return
             if len(remotes) == 0:
-                print("[lk] room is empty: all callers disconnected", flush=True)
+                print("[lk] room is empty during an active call: caller hung up", flush=True)
                 if self.on_empty_room:
                     self.on_empty_room()
 
