@@ -1038,7 +1038,17 @@ class TelephoneManager:
             # same tick (device button, watchdog, empty room, HTTP /call/end);
             # only the first one should tear anything down.
             return
-        print("[call] call ended: releasing listener lock", flush=True)
+        # Name the caller: several independent paths can end a call (device
+        # button, watchdog, empty room, HTTP /call/end, p2p). The old line was
+        # identical for all of them, so a call that "ended by itself" could not
+        # be attributed. inspect's frame gives the function for free.
+        import inspect as _inspect
+        _who = "?"
+        for _fr in _inspect.stack()[1:4]:
+            if _fr.function not in ("on_button_hangup", "_run"):
+                _who = f"{_fr.function}:{_fr.lineno}"
+                break
+        print(f"[call] ended by {_who} (notify_esp={notify_esp})", flush=True)
         set_state("IDLE", f"on_button_hangup notify_esp={notify_esp}")
         STATS.is_on_hold = False
         STATS.active_call_id = None
