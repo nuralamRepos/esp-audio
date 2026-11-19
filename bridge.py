@@ -18,6 +18,7 @@ import signal
 import socket
 import struct
 import sys
+import threading
 import time
 from collections import deque
 import hmac
@@ -314,6 +315,78 @@ class DeviceCallLock:
         }
 
 STATS = DeviceCallLock()
+
+# ---------------------------------------------------------------- state tracing
+# ---------------------------------------------------------------- log capture
+# The bridge runs on Render, where stdout is only visible in the dashboard. That
+# made every runtime failure ("the call closed itself while ringing") invisible
+# from the client side. Everything printed is now ALSO kept in a bounded ring
+# buffer and served from /logs, so the exact line that ended a call can be read
+# over HTTP while it is happening.
+import collections as _collections
+
+LOG_RING = _collections.deque(maxlen=1000)
+_log_seq = 0
+
+
+class _TeeStdout:
+    def __init__(self, real):
+        self._real = real
+        self._buf = ""
+        self._lock = threading.Lock()
+
+    def write(self, data):
+        global _log_seq
+        if not data:
+            return 0
+        try:
+            self._real.write(data)
+        except Exception:
+            pass
+        with self._lock:
+            self._buf += data
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                _log_seq += 1
+                LOG_RING.append((_log_seq, time.strftime("%H:%M:%S"), line))
+        return len(data)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False
+
+
+sys.stdout = _TeeStdout(sys.stdout)
+
+
+def set_state(new_state, why=""):
+    """Change the bridge call state and ALWAYS log the caller.
+
+    Call state used to change in eight different places with no record of which
+    one fired, so a call that "closed itself while ringing" could not be traced.
+    Every transition now prints the old -> new value plus the immediate caller,
+    which makes the culprit a single log line instead of an investigation.
+    """
+    old = STATS.state
+    if old == new_state:
+        return
+    STATS.state = new_state
+    import inspect
+    caller = "?"
+    try:
+        for fr in inspect.stack()[1:4]:
+            if fr.function not in ("set_state", "notify_status_change"):
+                caller = f"{fr.function}:{fr.lineno}"
+                break
+    except Exception:
+        pass
+    print(f"[state] {old} -> {new_state}  ({caller}) {why}".rstrip(), flush=True)
+
 
 # ---------------------------------------------------------------- 4-Digit Extension Directory (Zero Collision PBX Registry)
 
@@ -888,10 +961,10 @@ class TelephoneManager:
     def set_hold(self, hold: bool):
         STATS.is_on_hold = hold
         if hold:
-            STATS.state = "ON_HOLD"
+            set_state("ON_HOLD", "set_hold(true)")
             print(f"[call] call {STATS.active_call_id} placed on HOLD", flush=True)
         else:
-            STATS.state = "IN_CALL"
+            set_state("IN_CALL", "set_hold(false)")
             print(f"[call] call {STATS.active_call_id} resumed from HOLD", flush=True)
         notify_status_change()
 
@@ -902,7 +975,7 @@ class TelephoneManager:
         caller_id = next_caller["caller_id"]
         call_id = f"call_{int(time.time())}_{caller_id}"
         print(f"[queue] Promoting queued caller '{caller_id}' to active ringing call ({call_id})", flush=True)
-        STATS.state = "RINGING"
+        set_state("RINGING", "queued caller promoted")
         STATS.is_on_hold = False
         STATS.active_call_id = call_id
         STATS.active_caller_id = caller_id
@@ -921,7 +994,7 @@ class TelephoneManager:
         hfp_call_accept() and would only be re-triggered by an echo.
         """
         print("[call] answered; connecting audio on-demand", flush=True)
-        STATS.state = "IN_CALL"
+        set_state("IN_CALL", "on_button_accept")
         STATS.is_on_hold = False
         STATS.call_start_time = time.time()
         STATS.ring_start_time = None
@@ -933,7 +1006,7 @@ class TelephoneManager:
 
     def on_button_hangup(self, notify_esp=True):
         print("[call] call ended: releasing listener lock", flush=True)
-        STATS.state = "IDLE"
+        set_state("IDLE", f"on_button_hangup notify_esp={notify_esp}")
         STATS.is_on_hold = False
         STATS.active_call_id = None
         STATS.active_caller_id = None
@@ -975,7 +1048,7 @@ class TelephoneManager:
         call_id = f"call_{int(time.time())}_esp_to_{target_ext}"
         print(f"[call] ESP32 outgoing call to {target_ext} initiated ({call_id})", flush=True)
 
-        STATS.state = "RINGING"
+        set_state("RINGING", f"call_start_handler caller={caller_id}")
         STATS.active_call_id = call_id
         STATS.active_caller_id = "0000"
         STATS.caller_id = "0000"
@@ -1081,6 +1154,31 @@ def create_app(mgr: TelephoneManager) -> web.Application:
     # Routes
     async def ping_handler(request):
         return web.Response(text="pong")
+
+    async def logs_handler(request):
+        """Return captured bridge log lines, newest last.
+
+        ?since=N returns only lines with seq > N, which makes it cheap to poll
+        from a shell while reproducing a failure.
+        """
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            since = int(request.query.get("since", "0"))
+        except ValueError:
+            since = 0
+        try:
+            limit = int(request.query.get("limit", "400"))
+        except ValueError:
+            limit = 400
+        items = [{"seq": q, "t": t, "line": l}
+                 for (q, t, l) in list(LOG_RING) if q > since][-limit:]
+        return web.json_response({
+            "seq": _log_seq,
+            "count": len(items),
+            "lines": items,
+            "state": STATS.state,
+        })
 
     async def status_handler(request):
         if not check_auth(request):
@@ -1206,7 +1304,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
             call_id = f"call_{int(time.time())}_{caller_id}"
             print(f"[call] Reserved for caller '{caller_id}' (call_id={call_id})", flush=True)
 
-            STATS.state = "RINGING"
+            set_state("RINGING", f"call_start_handler caller={caller_id}")
             STATS.active_call_id = call_id
             STATS.active_caller_id = caller_id
             STATS.caller_id = caller_id
@@ -1430,8 +1528,30 @@ def create_app(mgr: TelephoneManager) -> web.Application:
 
         mgr.device_link.ws = ws
         STATS.device_addr = (remote_ip, 443)
-        STATS.state = "IDLE"
-        notify_status_change()
+
+        # DO NOT RESET THE CALL STATE ON RECONNECT.
+        #
+        # This used to be an unconditional STATS.state = "IDLE", which is why a
+        # call rang for a few seconds and then "closed itself": the device's
+        # WebSocket reconnects routinely (Render's proxy cycles the socket, and
+        # so does the ESP32 when it re-associates), and every reconnect silently
+        # cancelled whatever call was in progress. Seen in the field as
+        # "it receives the ring but auto-closes".
+        #
+        # The link coming back is a link event, not a call event. Only adopt
+        # IDLE when we have no call to preserve. If a call IS in progress the
+        # device is still the same device, so re-arm it: re-send the ring (or
+        # tell it the far end already answered) so its OLED and buzzer match the
+        # bridge's state instead of being left stranded.
+        if STATS.state == "IDLE":
+            notify_status_change()
+        else:
+            print(f"[ws] reconnect during {STATS.state}; preserving the call", flush=True)
+            if STATS.state == "RINGING":
+                mgr.device_link.ring_device()
+            elif STATS.state in ("IN_CALL", "ON_HOLD"):
+                mgr.device_link.send_call_accept()
+            notify_status_change()
         mgr.device_link.send_extension_list()
 
         try:
@@ -1595,7 +1715,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
 
             # 1. Reset state machine & call records
             prev_call_id = STATS.active_call_id
-            STATS.state = "IDLE"
+            set_state("IDLE", "admin reset")
             STATS.is_on_hold = False
             STATS.active_call_id = None
             STATS.active_caller_id = None
@@ -1638,6 +1758,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
 
     app.router.add_get("/ping", ping_handler)
     app.router.add_get("/status", status_handler)
+    app.router.add_get("/logs", logs_handler)
     app.router.add_get("/devices", devices_handler)
     app.router.add_post("/call/start", call_start_handler)
     app.router.add_post("/call/end", call_end_handler)

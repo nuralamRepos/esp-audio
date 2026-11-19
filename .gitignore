@@ -4,3 +4,4 @@ __pycache__/
 *.log
 cert.pem
 key.pem
+extensions_db.json
