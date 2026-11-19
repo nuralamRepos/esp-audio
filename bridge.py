@@ -56,6 +56,9 @@ ROOM_NAME = os.environ.get("LIVEKIT_ROOM", "landline")
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "nuralam9922").strip()
 INACTIVITY_TIMEOUT_SEC = int(os.environ.get("INACTIVITY_TIMEOUT_SEC", 900))  # 15m dead-air silence timeout
 RING_TIMEOUT_SEC = int(os.environ.get("RING_TIMEOUT_SEC", 45))  # 45s ringing timeout
+# How long a call survives the device link dropping. A reconnect under load is
+# normal; hanging up on it made every blip look like the caller left.
+DEVICE_OFFLINE_GRACE_SEC = int(os.environ.get("DEVICE_OFFLINE_GRACE_SEC", 25))
 MAX_CALLS_PER_MIN = int(os.environ.get("MAX_CALLS_PER_MIN", 30))
 MAX_REQ_PER_MIN = int(os.environ.get("MAX_REQ_PER_MIN", 120))
 
@@ -122,6 +125,7 @@ PKT_CALL_END    = 0x12
 PKT_CALL_BUSY   = 0x13
 PKT_EXT_LIST    = 0x14
 PKT_CALL_DIAL   = 0x15
+PKT_HEALTH      = 0x16
 
 # ---------------------------------------------------------------- Rate Limiter & Auth
 
@@ -257,6 +261,16 @@ class DeviceCallLock:
         self.rx_dbfs = -120.0
         self.tx_dbfs = -120.0
         self.start_time = time.time()
+        # Reported by the device itself on every connect (PKT_HEALTH).
+        # boot_count rising between two reports means the chip RESTARTED; a
+        # reconnect with an unchanged count is only a transport blip. This is
+        # the difference between "the firmware crashed" and "Wi-Fi hiccuped",
+        # and it cannot be told apart from the socket alone.
+        self.dev_boot_count = None
+        self.dev_brownouts = None
+        self.dev_free_heap = None
+        self.dev_reset_reason = None
+        self.dev_connects = 0
 
     def as_dict(self):
         call_dur = 0
@@ -281,6 +295,13 @@ class DeviceCallLock:
             "rx_dbfs": round(self.rx_dbfs, 1),
             "tx_dbfs": round(self.tx_dbfs, 1),
             "uptime_sec": int(time.time() - self.start_time),
+            "device": {
+                "boot_count": self.dev_boot_count,
+                "brownouts": self.dev_brownouts,
+                "free_heap": self.dev_free_heap,
+                "reset_reason": self.dev_reset_reason,
+                "connects": self.dev_connects,
+            },
         }
 
 STATS = DeviceCallLock()
@@ -1199,6 +1220,16 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                 "expires_in": 3600
             })
 
+    async def _hangup_after_grace(dropped_ws):
+        await asyncio.sleep(DEVICE_OFFLINE_GRACE_SEC)
+        if mgr.device_link.ws is not None:
+            return                      # came back; keep the call
+        if STATS.state == "IDLE":
+            return
+        print("[ws] device did not return; releasing the call", flush=True)
+        mgr.on_button_hangup(notify_esp=False)
+        notify_status_change()
+
     async def call_end_handler(request):
         if not check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -1417,6 +1448,24 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                         target_ext = data[1:5].decode("ascii", errors="ignore")
                         print(f"[ws] ESP32 physical dial: outgoing call to extension {target_ext}", flush=True)
                         asyncio.create_task(mgr.initiate_outgoing_call_to_ext(target_ext))
+                    elif kind == PKT_HEALTH:
+                        # type + 3 x u32 LE + u8 reset reason
+                        if len(data) >= 14:
+                            boots, browns, heap = struct.unpack_from("<III", data, 1)
+                            reason = data[13]
+                            prev = STATS.dev_boot_count
+                            STATS.dev_boot_count = boots
+                            STATS.dev_brownouts = browns
+                            STATS.dev_free_heap = heap
+                            STATS.dev_reset_reason = reason
+                            STATS.dev_connects += 1
+                            if prev is not None and boots > prev:
+                                print(f"[device] RESET detected: boot #{prev} -> #{boots} "
+                                      f"(brownouts={browns}, reason={reason}, heap={heap})",
+                                      flush=True)
+                            else:
+                                print(f"[device] health: boot #{boots}, brownouts={browns}, "
+                                      f"free_heap={heap}, reset_reason={reason}", flush=True)
                     elif kind == PKT_PING:
                         await ws.send_bytes(bytes([PKT_PONG]))
                     elif kind == PKT_CONTROL:
@@ -1429,7 +1478,22 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                 mgr.device_link.ws = None
                 STATS.device_addr = None
                 if STATS.state != "IDLE":
-                    mgr.on_button_hangup(notify_esp=False)
+                    # DO NOT hang up yet.
+                    #
+                    # This used to call on_button_hangup() immediately, which
+                    # made every transport blip look like the caller hanging up.
+                    # Measured during a call: the device reconnects (the socket
+                    # had been dropped, the link did not fail), the finally block
+                    # runs first, the call is torn down and the reconnect lands
+                    # in IDLE. From the phone that reads as "the call closed
+                    # itself after a few seconds".
+                    #
+                    # A landline must tolerate a brief loss of the line. Give it
+                    # DEVICE_OFFLINE_GRACE_SEC to come back; only a real absence
+                    # is treated as the far end disappearing.
+                    print(f"[ws] call preserved for {DEVICE_OFFLINE_GRACE_SEC}s "
+                          f"awaiting reconnect", flush=True)
+                    asyncio.create_task(_hangup_after_grace(ws))
                 notify_status_change()
 
         return ws
