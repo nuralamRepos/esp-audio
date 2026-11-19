@@ -84,6 +84,33 @@ async def broadcast_status():
     for ws in dead:
         CLIENT_WEBSOCKETS.discard(ws)
 
+def notify_extensions_change(device_link=None):
+    if CLIENT_WEBSOCKETS:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(broadcast_extensions())
+        except RuntimeError:
+            pass
+    if device_link:
+        device_link.send_extension_list()
+
+async def broadcast_extensions():
+    if not CLIENT_WEBSOCKETS:
+        return
+    payload = {
+        "type": "extensions_update",
+        "extensions": EXTENSIONS.list_extensions()
+    }
+    dead = []
+    for ws in list(CLIENT_WEBSOCKETS):
+        try:
+            if not ws.closed:
+                await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        CLIENT_WEBSOCKETS.discard(ws)
+
 # Protocol Opcodes (ESP32 <-> Gateway)
 PKT_CONTROL     = 0x01
 PKT_AUDIO       = 0x02
@@ -93,6 +120,8 @@ PKT_CALL_RING   = 0x10
 PKT_CALL_ACCEPT = 0x11
 PKT_CALL_END    = 0x12
 PKT_CALL_BUSY   = 0x13
+PKT_EXT_LIST    = 0x14
+PKT_CALL_DIAL   = 0x15
 
 # ---------------------------------------------------------------- Rate Limiter & Auth
 
@@ -246,6 +275,82 @@ class DeviceCallLock:
 
 STATS = DeviceCallLock()
 
+# ---------------------------------------------------------------- 4-Digit Extension Directory
+class ExtensionRegistry:
+    """Manages unique 4-digit logical phone extensions (e.g. 1001-9999 for mobile apps, 0000 for ESP32)."""
+    def __init__(self):
+        self._entries = {}  # ext -> dict
+
+    def register(self, ext: str, client_id: str, display_name: str, ws: web.WebSocketResponse = None) -> tuple[bool, str]:
+        ext = ext.strip()
+        if not (len(ext) == 4 and ext.isdigit()):
+            return False, "Extension must be exactly 4 digits (e.g. 1111)"
+        if ext == "0000":
+            return False, "Extension 0000 is reserved for ESP32 Landline"
+
+        now = time.time()
+        # Clean up stale dead extensions (> 15m without active websocket)
+        for e, info in list(self._entries.items()):
+            if info.get("ws") is None and (now - info.get("last_seen", 0) > 900):
+                del self._entries[e]
+
+        existing = self._entries.get(ext)
+        if existing and existing.get("client_id") != client_id:
+            # Active check: open websocket or recent heartbeat within 120s
+            is_active = (existing.get("ws") is not None and not existing["ws"].closed) or (now - existing.get("last_seen", 0) < 120)
+            if is_active:
+                return False, f"Extension {ext} is already claimed by an active device"
+
+        self._entries[ext] = {
+            "extension": ext,
+            "client_id": client_id,
+            "display_name": display_name or f"User {ext}",
+            "last_seen": now,
+            "ws": ws
+        }
+        return True, "Registered successfully"
+
+    def heartbeat(self, client_id: str):
+        now = time.time()
+        for ext, info in self._entries.items():
+            if info.get("client_id") == client_id:
+                info["last_seen"] = now
+
+    def deregister(self, ext: str, client_id: str) -> bool:
+        existing = self._entries.get(ext)
+        if existing and existing.get("client_id") == client_id:
+            del self._entries[ext]
+            return True
+        return False
+
+    def get_by_extension(self, ext: str) -> dict | None:
+        return self._entries.get(ext)
+
+    def list_extensions(self) -> list[dict]:
+        now = time.time()
+        result = [
+            {
+                "extension": "0000",
+                "display_name": "ESP32 ল্যান্ডলাইন",
+                "client_id": "esp32-home",
+                "online": STATS.device_addr is not None,
+                "state": STATS.state.lower()
+            }
+        ]
+        for ext, info in self._entries.items():
+            ws = info.get("ws")
+            is_online = (ws is not None and not ws.closed) or (now - info.get("last_seen", 0) < 120)
+            result.append({
+                "extension": ext,
+                "display_name": info.get("display_name", f"User {ext}"),
+                "client_id": info.get("client_id", ""),
+                "online": is_online,
+                "state": "idle" if is_online else "offline"
+            })
+        return sorted(result, key=lambda x: x["extension"])
+
+EXTENSIONS = ExtensionRegistry()
+
 def compute_dbfs(pcm: bytes):
     if not pcm or len(pcm) < 2:
         return -120.0
@@ -310,6 +415,18 @@ class DeviceLink:
                 pass
         elif self.udp_transport and self.udp_addr:
             self.udp_transport.sendto(bytes([PKT_CALL_BUSY]), self.udp_addr)
+
+    def send_extension_list(self):
+        if not self.ws or self.ws.closed:
+            return
+        active_exts = [e["extension"] for e in EXTENSIONS.list_extensions() if e["extension"] != "0000" and e["online"]]
+        pkt = bytearray([PKT_EXT_LIST, min(len(active_exts), 16)])
+        for e in active_exts[:16]:
+            pkt.extend(e.encode("ascii")[:4])
+        try:
+            asyncio.create_task(self.ws.send_bytes(bytes(pkt)))
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------- UDP Link Protocol (Fallback)
 
@@ -676,6 +793,59 @@ class TelephoneManager:
         if STATS.call_queue:
             asyncio.get_running_loop().call_later(1.0, self.promote_next_queued_caller)
 
+    async def initiate_outgoing_call_to_ext(self, target_ext: str):
+        if STATS.state != "IDLE":
+            print(f"[call] Cannot dial out: ESP32 is in state {STATS.state}", flush=True)
+            self.device_link.send_call_busy()
+            return
+
+        entry = EXTENSIONS.get_by_extension(target_ext)
+        if not entry:
+            print(f"[call] Dial failed: Extension {target_ext} not registered", flush=True)
+            self.device_link.send_call_busy()
+            return
+
+        ws = entry.get("ws")
+        now = time.time()
+        is_online = (ws is not None and not ws.closed) or (now - entry.get("last_seen", 0) < 120)
+        if not is_online:
+            print(f"[call] Dial failed: Extension {target_ext} is offline", flush=True)
+            self.device_link.send_call_busy()
+            return
+
+        caller_id = "0000"
+        call_id = f"call_{int(time.time())}_esp_to_{target_ext}"
+        print(f"[call] ESP32 outgoing call to {target_ext} initiated ({call_id})", flush=True)
+
+        STATS.state = "RINGING"
+        STATS.active_call_id = call_id
+        STATS.active_caller_id = f"ext_{target_ext}"
+        STATS.ring_start_time = time.time()
+        STATS.last_activity_time = time.time()
+        notify_status_change()
+
+        # Connect LiveKit bridge session
+        asyncio.create_task(self.start_call_session())
+
+        # Generate credentials for mobile recipient
+        cred = generate_caller_token(f"user_{target_ext}")
+
+        # Send push notification over target's WebSocket
+        if ws and not ws.closed:
+            try:
+                await ws.send_json({
+                    "type": "incoming_call",
+                    "call_id": call_id,
+                    "caller_id": "0000",
+                    "caller_name": "ESP32 ল্যান্ডলাইন",
+                    "caller_ext": "0000",
+                    "room": cred["room"],
+                    "livekit_url": cred["url"],
+                    "token": cred["token"]
+                })
+            except Exception as e:
+                print(f"[call] Failed to notify extension {target_ext}: {e}", flush=True)
+
 # ---------------------------------------------------------------- Token Generator
 
 def generate_caller_token(caller_id: str):
@@ -747,15 +917,71 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         if not check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
 
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        target_ext = body.get("target_ext", "0000")
+        caller_id = body.get("caller_id", "android-caller")
+        caller_ext = body.get("caller_ext", "unknown")
+        caller_name = body.get("caller_name", caller_id)
+
+        # Direct mobile-to-mobile extension call
+        if target_ext != "0000":
+            entry = EXTENSIONS.get_by_extension(target_ext)
+            if not entry:
+                return web.json_response({"error": "not_found", "detail": f"Extension {target_ext} not registered"}, status=404)
+            ws = entry.get("ws")
+            now = time.time()
+            is_online = (ws is not None and not ws.closed) or (now - entry.get("last_seen", 0) < 120)
+            if not is_online:
+                return web.json_response({"error": "offline", "detail": f"Extension {target_ext} is currently offline"}, status=404)
+
+            room_name = f"room_{min(caller_ext, target_ext)}_{max(caller_ext, target_ext)}_{int(time.time())}"
+            from livekit import api
+            token_caller = (api.AccessToken(LIVEKIT_KEY, LIVEKIT_SECRET)
+                            .with_identity(f"ext_{caller_ext}")
+                            .with_name(caller_name)
+                            .with_grants(api.VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True))
+                            .to_jwt())
+            token_target = (api.AccessToken(LIVEKIT_KEY, LIVEKIT_SECRET)
+                            .with_identity(f"ext_{target_ext}")
+                            .with_name(entry.get("display_name", f"User {target_ext}"))
+                            .with_grants(api.VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True))
+                            .to_jwt())
+
+            call_id = f"p2p_{int(time.time())}_{caller_ext}_to_{target_ext}"
+            if ws and not ws.closed:
+                try:
+                    await ws.send_json({
+                        "type": "incoming_call",
+                        "call_id": call_id,
+                        "caller_id": caller_ext,
+                        "caller_name": caller_name,
+                        "caller_ext": caller_ext,
+                        "room": room_name,
+                        "livekit_url": LIVEKIT_URL,
+                        "token": token_target
+                    })
+                except Exception as e:
+                    print(f"[p2p] notification failed: {e}", flush=True)
+
+            return web.json_response({
+                "call_id": call_id,
+                "caller_id": caller_id,
+                "caller_ext": caller_ext,
+                "target_ext": target_ext,
+                "room": room_name,
+                "livekit_url": LIVEKIT_URL,
+                "token": token_caller,
+                "expires_in": 3600
+            })
+
+        # Calls to ESP32 Landline (0000)
         if STATS.state in ("IN_CALL", "RINGING", "ON_HOLD"):
-            queue_requested = False
-            caller_id = "android-caller"
-            try:
-                body = await request.json()
-                queue_requested = body.get("queue", False)
-                caller_id = body.get("caller_id", "android-caller")
-            except Exception:
-                pass
+            queue_requested = body.get("queue", False)
 
             if queue_requested:
                 if len(STATS.call_queue) >= 3:
@@ -796,13 +1022,6 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                 "active_caller_id": STATS.active_caller_id,
                 "queue_len": len(STATS.call_queue)
             }, status=486)
-
-        caller_id = "android-caller"
-        try:
-            body = await request.json()
-            caller_id = body.get("caller_id", "android-caller")
-        except Exception:
-            pass
 
         call_id = f"call_{int(time.time())}_{caller_id}"
         print(f"[call] Reserved for caller '{caller_id}' (call_id={call_id})", flush=True)
@@ -914,6 +1133,58 @@ def create_app(mgr: TelephoneManager) -> web.Application:
             "credentials": token_info
         })
 
+    async def call_accept_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if STATS.state == "RINGING":
+            mgr.on_button_accept()
+            return web.json_response({"status": "accepted", "call_id": STATS.active_call_id})
+        return web.json_response({"status": "ignored", "state": STATS.state.lower()})
+
+    async def extensions_list_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response(EXTENSIONS.list_extensions())
+
+    async def extensions_register_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+
+        ext = body.get("extension", "").strip()
+        client_id = body.get("client_id", "").strip()
+        display_name = body.get("display_name", "").strip()
+
+        if not ext or not client_id:
+            return web.json_response({"error": "missing_fields", "detail": "extension and client_id required"}, status=400)
+
+        ok, msg = EXTENSIONS.register(ext, client_id, display_name)
+        if not ok:
+            return web.json_response({"error": "conflict", "detail": msg}, status=409)
+
+        notify_extensions_change(mgr.device_link)
+        return web.json_response({"status": "ok", "message": msg, "extension": ext, "extensions": EXTENSIONS.list_extensions()})
+
+    async def extensions_deregister_handler(request):
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid_json"}, status=400)
+
+        ext = body.get("extension", "").strip()
+        client_id = body.get("client_id", "").strip()
+
+        ok = EXTENSIONS.deregister(ext, client_id)
+        if ok:
+            notify_extensions_change(mgr.device_link)
+            return web.json_response({"status": "ok", "message": "Deregistered"})
+        return web.json_response({"error": "not_found", "detail": "Extension or client_id mismatch"}, status=404)
+
     # Direct WebSocket Connection for ESP32 Hardware
     async def esp32_ws_handler(request):
         if not check_auth(request):
@@ -928,6 +1199,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         STATS.device_addr = (remote_ip, 443)
         STATS.state = "IDLE"
         notify_status_change()
+        mgr.device_link.send_extension_list()
 
         try:
             async for msg in ws:
@@ -948,6 +1220,10 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                     elif kind == PKT_CALL_END:
                         print("[ws] ESP32 physical button pressed: HANG UP", flush=True)
                         mgr.on_button_hangup(notify_esp=False)
+                    elif kind == PKT_CALL_DIAL:
+                        target_ext = data[1:5].decode("ascii", errors="ignore")
+                        print(f"[ws] ESP32 physical dial: outgoing call to extension {target_ext}", flush=True)
+                        asyncio.create_task(mgr.initiate_outgoing_call_to_ext(target_ext))
                     elif kind == PKT_PING:
                         await ws.send_bytes(bytes([PKT_PONG]))
                     elif kind == PKT_CONTROL:
@@ -973,14 +1249,50 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         ws = web.WebSocketResponse(heartbeat=20.0)
         await ws.prepare(request)
         CLIENT_WEBSOCKETS.add(ws)
+        registered_ext = None
+        registered_client_id = None
         try:
-            # Immediately send initial state
+            # Immediately send initial state & registered extensions
             await ws.send_json(STATS.as_dict())
+            await ws.send_json({
+                "type": "extensions_update",
+                "extensions": EXTENSIONS.list_extensions()
+            })
             async for msg in ws:
-                if msg.type == web.WSMsgType.TEXT and msg.data == "ping":
-                    await ws.send_str("pong")
+                if msg.type == web.WSMsgType.TEXT:
+                    if msg.data == "ping":
+                        await ws.send_str("pong")
+                    else:
+                        try:
+                            payload = json.loads(msg.data)
+                            msg_type = payload.get("type")
+                            if msg_type == "register":
+                                ext = payload.get("extension", "").strip()
+                                cid = payload.get("client_id", "").strip()
+                                dname = payload.get("display_name", "").strip()
+                                if ext and cid:
+                                    ok, m = EXTENSIONS.register(ext, cid, dname, ws=ws)
+                                    if ok:
+                                        registered_ext = ext
+                                        registered_client_id = cid
+                                        notify_extensions_change(mgr.device_link)
+                                        await ws.send_json({"type": "register_ack", "success": True, "extension": ext})
+                                    else:
+                                        await ws.send_json({"type": "register_ack", "success": False, "detail": m})
+                            elif msg_type == "heartbeat":
+                                cid = payload.get("client_id")
+                                if cid:
+                                    EXTENSIONS.heartbeat(cid)
+                                await ws.send_str("pong")
+                        except Exception:
+                            pass
         finally:
             CLIENT_WEBSOCKETS.discard(ws)
+            if registered_ext and registered_client_id:
+                entry = EXTENSIONS.get_by_extension(registered_ext)
+                if entry and entry.get("client_id") == registered_client_id:
+                    entry["ws"] = None
+                    notify_extensions_change(mgr.device_link)
 
         return ws
 
@@ -1001,6 +1313,10 @@ def create_app(mgr: TelephoneManager) -> web.Application:
     app.router.add_post("/call/hold", call_hold_handler)
     app.router.add_post("/call/reject", call_reject_handler)
     app.router.add_get("/call/poll", call_poll_handler)
+    app.router.add_post("/call/accept", call_accept_handler)
+    app.router.add_get("/extensions", extensions_list_handler)
+    app.router.add_post("/extensions/register", extensions_register_handler)
+    app.router.add_post("/extensions/deregister", extensions_deregister_handler)
     app.router.add_post("/hangup", call_end_handler)
     app.router.add_get("/esp32/ws", esp32_ws_handler)
     app.router.add_get("/client/ws", client_ws_handler)
