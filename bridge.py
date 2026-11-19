@@ -737,7 +737,11 @@ class DownlinkPacer:
                     else:
                         continue
 
-                if not STATS.is_on_hold:
+                # Only a call that is actually up may consume downlink audio.
+                # RINGING and IDLE must stay silent: the device is not in a call,
+                # and streaming to it there competes with Bluetooth SCO start-up
+                # (which is exactly when the link was seen to reset).
+                if STATS.state in ("IN_CALL", "ON_HOLD") and not STATS.is_on_hold:
                     filtered = self.processor.process_pcm16(chunk)
                     self.device_link.send_audio(filtered)
             except asyncio.CancelledError:
