@@ -541,6 +541,7 @@ class DeviceLink:
         self.on_call_accept = on_call_accept
         self.on_call_end = on_call_end
         self.ws = None
+        self.last_ws = None      # the socket a hangup-grace timer was armed on
         self.udp_transport = None
         self.udp_addr = None
 
@@ -1392,6 +1393,13 @@ def create_app(mgr: TelephoneManager) -> web.Application:
             return                      # came back; keep the call
         if STATS.state == "IDLE":
             return
+        # A second disconnect while this timer was pending used to fire the
+        # FIRST timer even though the device had rejoined in between: measured
+        # in the field as "device did not return" 3 s after a successful
+        # reconnect. Only act if the socket we armed on is still the one that is
+        # missing.
+        if mgr.device_link.last_ws is not dropped_ws and mgr.device_link.ws is None:
+            return
         print("[ws] device did not return; releasing the call", flush=True)
         mgr.on_button_hangup(notify_esp=False)
         notify_status_change()
@@ -1661,7 +1669,15 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                 elif msg.type == web.WSMsgType.ERROR:
                     print(f"[ws] connection error: {ws.exception()}", flush=True)
         finally:
-            print("[ws] ESP32 disconnected from cloud", flush=True)
+            # Record the close code. A clean 1000/1001 means the peer ended the
+            # session politely; 1006 means the TCP path died underneath (which
+            # is what a power/radio problem looks like). Without this the log
+            # says only "disconnected" for every cause.
+            try:
+                _cc = ws.close_code
+            except Exception:
+                _cc = None
+            print(f"[ws] ESP32 disconnected from cloud close_code={_cc}", flush=True)
             if mgr.device_link.ws is ws:
                 mgr.device_link.ws = None
                 STATS.device_addr = None
@@ -1681,6 +1697,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                     # is treated as the far end disappearing.
                     print(f"[ws] call preserved for {DEVICE_OFFLINE_GRACE_SEC}s "
                           f"awaiting reconnect", flush=True)
+                    mgr.device_link.last_ws = ws   # identify this grace window
                     asyncio.create_task(_hangup_after_grace(ws))
                 notify_status_change()
 
