@@ -56,8 +56,8 @@ ROOM_NAME = os.environ.get("LIVEKIT_ROOM", "landline")
 AUTH_TOKEN = os.environ.get("AUTH_TOKEN", "nuralam9922").strip()
 INACTIVITY_TIMEOUT_SEC = int(os.environ.get("INACTIVITY_TIMEOUT_SEC", 900))  # 15m dead-air silence timeout
 RING_TIMEOUT_SEC = int(os.environ.get("RING_TIMEOUT_SEC", 45))  # 45s ringing timeout
-MAX_CALLS_PER_MIN = int(os.environ.get("MAX_CALLS_PER_MIN", 6))
-MAX_REQ_PER_MIN = int(os.environ.get("MAX_REQ_PER_MIN", 60))
+MAX_CALLS_PER_MIN = int(os.environ.get("MAX_CALLS_PER_MIN", 30))
+MAX_REQ_PER_MIN = int(os.environ.get("MAX_REQ_PER_MIN", 120))
 
 CLIENT_WEBSOCKETS = set()
 
@@ -150,6 +150,10 @@ class RateLimiter:
 
         return True, ""
 
+    def clear(self):
+        self.general_limits.clear()
+        self.call_limits.clear()
+
 RATE_LIMITER = RateLimiter()
 
 def check_auth(request: web.Request) -> bool:
@@ -238,6 +242,9 @@ class DeviceCallLock:
         self.is_on_hold = False
         self.active_call_id = None
         self.active_caller_id = None
+        self.caller_id = None
+        self.target_ext = None
+        self.call_direction = None # "to_esp" or "from_esp"
         self.call_start_time = None
         self.ring_start_time = None
         self.last_activity_time = time.time()
@@ -264,6 +271,9 @@ class DeviceCallLock:
             "on_hold": self.is_on_hold,
             "active_call_id": self.active_call_id,
             "active_caller_id": self.active_caller_id,
+            "caller_id": self.caller_id or self.active_caller_id,
+            "target_ext": self.target_ext,
+            "call_direction": self.call_direction,
             "call_duration_sec": call_dur,
             "inactivity_timeout_sec": INACTIVITY_TIMEOUT_SEC,
             "queue_len": len(self.call_queue),
@@ -275,40 +285,93 @@ class DeviceCallLock:
 
 STATS = DeviceCallLock()
 
-# ---------------------------------------------------------------- 4-Digit Extension Directory
+# ---------------------------------------------------------------- 4-Digit Extension Directory (Zero Collision PBX Registry)
+
+EXTENSIONS_DB_FILE = os.path.join(HERE, "extensions_db.json")
+
 class ExtensionRegistry:
-    """Manages unique 4-digit logical phone extensions (e.g. 1001-9999 for mobile apps, 0000 for ESP32)."""
+    """Manages unique 4-digit logical phone extensions (1001-9999 for mobile apps/web, 0000 for ESP32).
+    Implements a Hotel Check-In pattern to guarantee ZERO collisions, permanent binding to client_id (UUID),
+    and persistence across restarts.
+    """
     def __init__(self):
-        self._entries = {}  # ext -> dict
+        self._entries = {}      # ext -> dict (runtime socket & state)
+        self._device_map = {}   # client_id -> {"ext": "1001", "display_name": "..."}
+        self._load_db()
 
-    def register(self, ext: str, client_id: str, display_name: str, ws: web.WebSocketResponse = None) -> tuple[bool, str]:
-        ext = ext.strip()
-        if not (len(ext) == 4 and ext.isdigit()):
-            return False, "Extension must be exactly 4 digits (e.g. 1111)"
-        if ext == "0000":
-            return False, "Extension 0000 is reserved for ESP32 Landline"
+    def _load_db(self):
+        if os.path.exists(EXTENSIONS_DB_FILE):
+            try:
+                with open(EXTENSIONS_DB_FILE, "r") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self._device_map = data
+                        print(f"[registry] Loaded {len(self._device_map)} permanent extension assignments from database", flush=True)
+            except Exception as e:
+                print(f"[registry] Notice loading extensions db: {e}", flush=True)
 
+    def _save_db(self):
+        try:
+            with open(EXTENSIONS_DB_FILE, "w") as f:
+                json.dump(self._device_map, f, indent=2)
+        except Exception as e:
+            print(f"[registry] Notice saving extensions db: {e}", flush=True)
+
+    def get_or_assign(self, client_id: str, display_name: str, requested_ext: str = None) -> tuple[str, bool]:
+        """Auto-assigns or returns the unique permanent extension for this client_id.
+        Guarantees ZERO COLLISIONS.
+        """
+        client_id = (client_id or "anonymous").strip()
+        display_name = (display_name or f"User {client_id[:6]}").strip()
+
+        # 1. Existing client: return their permanently assigned extension
+        if client_id in self._device_map:
+            assigned = self._device_map[client_id]["ext"]
+            self._device_map[client_id]["display_name"] = display_name
+            self._save_db()
+            return assigned, False
+
+        # 2. Check all currently assigned extensions
+        taken_exts = {v["ext"] for v in self._device_map.values()}
+        taken_exts.add("0000")  # Reserved for ESP32
+
+        # 3. If client requested an available valid 4-digit extension, grant it
+        if requested_ext and len(requested_ext) == 4 and requested_ext.isdigit() and requested_ext != "0000":
+            if requested_ext not in taken_exts:
+                self._device_map[client_id] = {"ext": requested_ext, "display_name": display_name}
+                self._save_db()
+                return requested_ext, True
+
+        # 4. Sequentially assign the lowest free 4-digit extension in pool [1001..9999]
+        for candidate in range(1001, 10000):
+            c_str = f"{candidate:04d}"
+            if c_str not in taken_exts:
+                self._device_map[client_id] = {"ext": c_str, "display_name": display_name}
+                self._save_db()
+                return c_str, True
+
+        fallback = f"{np.random.randint(1001, 9999):04d}"
+        self._device_map[client_id] = {"ext": fallback, "display_name": display_name}
+        self._save_db()
+        return fallback, True
+
+    def register(self, ext: str, client_id: str, display_name: str, ws: web.WebSocketResponse = None) -> tuple[bool, str, str]:
+        """Registers a live client. Auto-resolves extensions to prevent collision."""
+        client_id = (client_id or "").strip()
+        if not client_id:
+            return False, "client_id is required", ""
+
+        assigned_ext, is_new = self.get_or_assign(client_id, display_name, requested_ext=ext)
         now = time.time()
-        # Clean up stale dead extensions (> 15m without active websocket)
-        for e, info in list(self._entries.items()):
-            if info.get("ws") is None and (now - info.get("last_seen", 0) > 900):
-                del self._entries[e]
 
-        existing = self._entries.get(ext)
-        if existing and existing.get("client_id") != client_id:
-            # Active check: open websocket or recent heartbeat within 120s
-            is_active = (existing.get("ws") is not None and not existing["ws"].closed) or (now - existing.get("last_seen", 0) < 120)
-            if is_active:
-                return False, f"Extension {ext} is already claimed by an active device"
-
-        self._entries[ext] = {
-            "extension": ext,
+        self._entries[assigned_ext] = {
+            "extension": assigned_ext,
             "client_id": client_id,
-            "display_name": display_name or f"User {ext}",
+            "display_name": display_name or self._device_map.get(client_id, {}).get("display_name", f"User {assigned_ext}"),
             "last_seen": now,
             "ws": ws
         }
-        return True, "Registered successfully"
+        return True, "Registered successfully", assigned_ext
 
     def heartbeat(self, client_id: str):
         now = time.time()
@@ -337,16 +400,22 @@ class ExtensionRegistry:
                 "state": STATS.state.lower()
             }
         ]
-        for ext, info in self._entries.items():
-            ws = info.get("ws")
-            is_online = (ws is not None and not ws.closed) or (now - info.get("last_seen", 0) < 120)
+        # Include all known registered devices from persistent database
+        seen_exts = {"0000"}
+        for client_id, dev_info in self._device_map.items():
+            ext = dev_info["ext"]
+            seen_exts.add(ext)
+            live = self._entries.get(ext)
+            ws = live.get("ws") if live else None
+            is_online = (ws is not None and not ws.closed) or (live is not None and (now - live.get("last_seen", 0) < 120))
             result.append({
                 "extension": ext,
-                "display_name": info.get("display_name", f"User {ext}"),
-                "client_id": info.get("client_id", ""),
+                "display_name": dev_info.get("display_name", f"User {ext}"),
+                "client_id": client_id,
                 "online": is_online,
                 "state": "idle" if is_online else "offline"
             })
+
         return sorted(result, key=lambda x: x["extension"])
 
 EXTENSIONS = ExtensionRegistry()
@@ -730,8 +799,15 @@ class TelephoneManager:
 
     async def stop_call_session(self):
         if self.livekit.room is not None:
-            print("[livekit] disconnected from room (preserving quota)", flush=True)
+            print("[livekit] disconnecting from room (preserving quota)", flush=True)
             await self.livekit.stop()
+        try:
+            lkapi = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_KEY, LIVEKIT_SECRET)
+            await lkapi.room.delete_room(api.DeleteRoomRequest(room=ROOM_NAME))
+            await lkapi.aclose()
+            print(f"[livekit] deleted room '{ROOM_NAME}' to prevent orphan leaks and save quota", flush=True)
+        except Exception as e:
+            print(f"[livekit] notice deleting room: {e}", flush=True)
 
     def on_device_audio(self, pcm: bytes):
         STATS.last_activity_time = time.time()
@@ -782,6 +858,9 @@ class TelephoneManager:
         STATS.is_on_hold = False
         STATS.active_call_id = None
         STATS.active_caller_id = None
+        STATS.caller_id = None
+        STATS.target_ext = None
+        STATS.call_direction = None
         STATS.call_start_time = None
         STATS.ring_start_time = None
         if notify_esp:
@@ -819,7 +898,10 @@ class TelephoneManager:
 
         STATS.state = "RINGING"
         STATS.active_call_id = call_id
-        STATS.active_caller_id = f"ext_{target_ext}"
+        STATS.active_caller_id = "0000"
+        STATS.caller_id = "0000"
+        STATS.target_ext = target_ext
+        STATS.call_direction = "from_esp"
         STATS.ring_start_time = time.time()
         STATS.last_activity_time = time.time()
         notify_status_change()
@@ -874,16 +956,32 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                 }
             )
 
-        # Rate limiting
-        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.remote or "unknown"
-        is_call_op = request.path in ("/call/start", "/token")
-        allowed, limit_msg = RATE_LIMITER.check(client_ip, is_call_op=is_call_op)
-        if not allowed:
-            return web.json_response(
-                {"error": "too_many_requests", "detail": limit_msg},
-                status=429,
-                headers={"Retry-After": "60", "Access-Control-Allow-Origin": "*"}
-            )
+        # Rate limiting.
+        #
+        # Authenticated clients are NOT rate limited. The token is the credential,
+        # and the device link holds a single long-lived WebSocket that legitimately
+        # reconnects whenever Render or Cloudflare drops it; counting those
+        # handshakes against a per-IP budget meant the ESP32 could lock itself out
+        # permanently. Measured on this deployment: the device retried every 5 s,
+        # each retry counted, and the limiter then answered *every* request from
+        # that IP - including the retry - with HTTP 429 for 60 s. retry-after
+        # equalled the retry interval, so the bucket was never allowed to drain
+        # and the device could never reconnect.
+        #
+        # Unauthenticated traffic is still limited, which is what the limiter is
+        # for: it exists to stop anonymous abuse of /token and /call/start.
+        is_authenticated = check_auth(request)
+        if not is_authenticated:
+            xff = request.headers.get("cf-connecting-ip") or request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "")
+            client_ip = xff.split(",")[0].strip() if xff else (request.remote or "unknown")
+            is_call_op = request.path in ("/call/start", "/token")
+            allowed, limit_msg = RATE_LIMITER.check(client_ip, is_call_op=is_call_op)
+            if not allowed:
+                return web.json_response(
+                    {"error": "too_many_requests", "detail": limit_msg},
+                    status=429,
+                    headers={"Retry-After": "60", "Access-Control-Allow-Origin": "*"}
+                )
 
         try:
             response = await handler(request)
@@ -898,6 +996,8 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         return response
 
     app.middlewares.append(cors_and_rate_middleware)
+
+    CALL_LOCK = asyncio.Lock()
 
     # Routes
     async def ping_handler(request):
@@ -980,76 +1080,81 @@ def create_app(mgr: TelephoneManager) -> web.Application:
             })
 
         # Calls to ESP32 Landline (0000)
-        if STATS.state in ("IN_CALL", "RINGING", "ON_HOLD"):
-            queue_requested = body.get("queue", False)
+        async with CALL_LOCK:
+            if STATS.state in ("IN_CALL", "RINGING", "ON_HOLD"):
+                queue_requested = body.get("queue", False)
 
-            if queue_requested:
-                if len(STATS.call_queue) >= 3:
+                if queue_requested:
+                    if len(STATS.call_queue) >= 3:
+                        return web.json_response({
+                            "error": "queue_full",
+                            "detail": "Call queue is full (max 3 waiting callers)",
+                            "active_caller_id": STATS.active_caller_id
+                        }, status=486)
+                    
+                    # Check if already in queue
+                    existing = next((q for q in STATS.call_queue if q["caller_id"] == caller_id), None)
+                    if not existing:
+                        call_id = f"queue_{int(time.time())}_{caller_id}"
+                        item = {
+                            "call_id": call_id,
+                            "caller_id": caller_id,
+                            "queued_at": time.time(),
+                            "status": "queued"
+                        }
+                        STATS.call_queue.append(item)
+                    else:
+                        item = existing
+                    
+                    pos = STATS.call_queue.index(item) + 1
+                    print(f"[queue] Caller '{caller_id}' queued at position {pos}", flush=True)
                     return web.json_response({
-                        "error": "queue_full",
-                        "detail": "Call queue is full (max 3 waiting callers)",
-                        "active_caller_id": STATS.active_caller_id
-                    }, status=486)
-                
-                # Check if already in queue
-                existing = next((q for q in STATS.call_queue if q["caller_id"] == caller_id), None)
-                if not existing:
-                    call_id = f"queue_{int(time.time())}_{caller_id}"
-                    item = {
-                        "call_id": call_id,
+                        "status": "queued",
+                        "call_id": item["call_id"],
                         "caller_id": caller_id,
-                        "queued_at": time.time(),
-                        "status": "queued"
-                    }
-                    STATS.call_queue.append(item)
-                else:
-                    item = existing
-                
-                pos = STATS.call_queue.index(item) + 1
-                print(f"[queue] Caller '{caller_id}' queued at position {pos}", flush=True)
+                        "queue_position": pos,
+                        "target_device": DEVICE_ID
+                    }, status=202)
+
                 return web.json_response({
-                    "status": "queued",
-                    "call_id": item["call_id"],
-                    "caller_id": caller_id,
-                    "queue_position": pos,
-                    "target_device": DEVICE_ID
-                }, status=202)
+                    "error": "busy",
+                    "detail": "ESP32 listener is currently on another call",
+                    "active_call_id": STATS.active_call_id,
+                    "active_caller_id": STATS.active_caller_id,
+                    "queue_len": len(STATS.call_queue)
+                }, status=486)
 
+            call_id = f"call_{int(time.time())}_{caller_id}"
+            print(f"[call] Reserved for caller '{caller_id}' (call_id={call_id})", flush=True)
+
+            STATS.state = "RINGING"
+            STATS.active_call_id = call_id
+            STATS.active_caller_id = caller_id
+            STATS.caller_id = caller_id
+            STATS.target_ext = target_ext
+            STATS.call_direction = "to_esp"
+            STATS.ring_start_time = time.time()
+            notify_status_change()
+
+            mgr.device_link.ring_device()
+            asyncio.create_task(mgr.start_call_session())
+
+            cred = generate_caller_token(caller_id)
             return web.json_response({
-                "error": "busy",
-                "detail": "ESP32 listener is currently on another call",
-                "active_call_id": STATS.active_call_id,
-                "active_caller_id": STATS.active_caller_id,
-                "queue_len": len(STATS.call_queue)
-            }, status=486)
-
-        call_id = f"call_{int(time.time())}_{caller_id}"
-        print(f"[call] Reserved for caller '{caller_id}' (call_id={call_id})", flush=True)
-
-        STATS.state = "RINGING"
-        STATS.active_call_id = call_id
-        STATS.active_caller_id = caller_id
-        STATS.ring_start_time = time.time()
-        notify_status_change()
-
-        mgr.device_link.ring_device()
-        asyncio.create_task(mgr.start_call_session())
-
-        cred = generate_caller_token(caller_id)
-        return web.json_response({
-            "call_id": call_id,
-            "caller_id": caller_id,
-            "target_device": DEVICE_ID,
-            "room": cred["room"],
-            "livekit_url": cred["url"],
-            "token": cred["token"],
-            "expires_in": 3600
-        })
+                "call_id": call_id,
+                "caller_id": caller_id,
+                "target_device": DEVICE_ID,
+                "room": cred["room"],
+                "livekit_url": cred["url"],
+                "token": cred["token"],
+                "expires_in": 3600
+            })
 
     async def call_end_handler(request):
         if not check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        mgr.on_button_hangup()
+        async with CALL_LOCK:
+            mgr.on_button_hangup()
         return web.json_response({"status": "ended", "device": DEVICE_ID})
 
     async def call_hold_handler(request):
@@ -1082,15 +1187,16 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         except Exception:
             pass
         
-        if STATS.state == "RINGING" and (caller_id is None or STATS.active_caller_id == caller_id):
-            print(f"[call] Ringing call rejected for caller '{STATS.active_caller_id}'", flush=True)
-            mgr.on_button_hangup()
-            return web.json_response({"status": "rejected", "detail": "call rejected"})
-        
-        if caller_id:
-            STATS.call_queue = [q for q in STATS.call_queue if q["caller_id"] != caller_id]
-            print(f"[queue] Removed caller '{caller_id}' from queue upon reject/cancel", flush=True)
-            return web.json_response({"status": "dequeued", "caller_id": caller_id})
+        async with CALL_LOCK:
+            if STATS.state == "RINGING":
+                print(f"[call] Ringing call rejected by client '{caller_id}' (active was '{STATS.active_caller_id}')", flush=True)
+                mgr.on_button_hangup()
+                return web.json_response({"status": "rejected", "detail": "call rejected"})
+            
+            if caller_id:
+                STATS.call_queue = [q for q in STATS.call_queue if q["caller_id"] != caller_id]
+                print(f"[queue] Removed caller '{caller_id}' from queue upon reject/cancel", flush=True)
+                return web.json_response({"status": "dequeued", "caller_id": caller_id})
         
         return web.json_response({"status": "ok", "state": STATS.state.lower()})
 
@@ -1158,15 +1264,53 @@ def create_app(mgr: TelephoneManager) -> web.Application:
         client_id = body.get("client_id", "").strip()
         display_name = body.get("display_name", "").strip()
 
-        if not ext or not client_id:
-            return web.json_response({"error": "missing_fields", "detail": "extension and client_id required"}, status=400)
+        if not client_id:
+            return web.json_response({"error": "missing_fields", "detail": "client_id is required"}, status=400)
 
-        ok, msg = EXTENSIONS.register(ext, client_id, display_name)
+        ok, msg, assigned_ext = EXTENSIONS.register(ext, client_id, display_name)
         if not ok:
             return web.json_response({"error": "conflict", "detail": msg}, status=409)
 
         notify_extensions_change(mgr.device_link)
-        return web.json_response({"status": "ok", "message": msg, "extension": ext, "extensions": EXTENSIONS.list_extensions()})
+        return web.json_response({
+            "status": "ok",
+            "message": msg,
+            "extension": assigned_ext,
+            "client_id": client_id,
+            "display_name": display_name,
+            "extensions": EXTENSIONS.list_extensions()
+        })
+
+    async def extensions_assign_handler(request):
+        """Auto-assigns or returns the unique permanent sequential extension for a client_id (Hotel Check-In)."""
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        client_id = request.query.get("client_id", "").strip()
+        display_name = request.query.get("display_name", "").strip()
+        requested_ext = request.query.get("extension", "").strip()
+
+        if request.can_read_body:
+            try:
+                body = await request.json()
+                client_id = body.get("client_id", client_id).strip()
+                display_name = body.get("display_name", display_name).strip()
+                requested_ext = body.get("extension", requested_ext).strip()
+            except Exception:
+                pass
+
+        if not client_id:
+            return web.json_response({"error": "missing_fields", "detail": "client_id is required"}, status=400)
+
+        assigned_ext, is_new = EXTENSIONS.get_or_assign(client_id, display_name, requested_ext=requested_ext)
+        notify_extensions_change(mgr.device_link)
+        return web.json_response({
+            "status": "assigned",
+            "is_new": is_new,
+            "extension": assigned_ext,
+            "client_id": client_id,
+            "display_name": display_name or f"User {assigned_ext}",
+            "extensions": EXTENSIONS.list_extensions()
+        })
 
     async def extensions_deregister_handler(request):
         if not check_auth(request):
@@ -1270,13 +1414,19 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                                 ext = payload.get("extension", "").strip()
                                 cid = payload.get("client_id", "").strip()
                                 dname = payload.get("display_name", "").strip()
-                                if ext and cid:
-                                    ok, m = EXTENSIONS.register(ext, cid, dname, ws=ws)
+                                if cid:
+                                    ok, m, assigned_ext = EXTENSIONS.register(ext, cid, dname, ws=ws)
                                     if ok:
-                                        registered_ext = ext
+                                        registered_ext = assigned_ext
                                         registered_client_id = cid
                                         notify_extensions_change(mgr.device_link)
-                                        await ws.send_json({"type": "register_ack", "success": True, "extension": ext})
+                                        await ws.send_json({
+                                            "type": "register_ack",
+                                            "success": True,
+                                            "extension": assigned_ext,
+                                            "client_id": cid,
+                                            "display_name": dname
+                                        })
                                     else:
                                         await ws.send_json({"type": "register_ack", "success": False, "detail": m})
                             elif msg_type == "heartbeat":
@@ -1305,6 +1455,65 @@ def create_app(mgr: TelephoneManager) -> web.Application:
             "status": "online"
         })
 
+    async def admin_reset_handler(request):
+        """Private development reset endpoint. Completely resets active calls, queues, LiveKit rooms, and rate limits."""
+        if not check_auth(request):
+            return web.json_response({"error": "unauthorized", "detail": "Valid authentication required"}, status=401)
+
+        clear_exts = False
+        try:
+            if request.can_read_body:
+                body = await request.json()
+                clear_exts = body.get("clear_extensions", False)
+        except Exception:
+            pass
+
+        async with CALL_LOCK:
+            print("[admin] Development Reset initiated via /admin/reset API", flush=True)
+
+            # 1. Reset state machine & call records
+            prev_call_id = STATS.active_call_id
+            STATS.state = "IDLE"
+            STATS.is_on_hold = False
+            STATS.active_call_id = None
+            STATS.active_caller_id = None
+            STATS.caller_id = None
+            STATS.target_ext = None
+            STATS.call_direction = None
+            STATS.call_start_time = None
+            STATS.ring_start_time = None
+            STATS.call_queue.clear()
+            STATS.last_activity_time = time.time()
+
+            # 2. Stop LiveKit session & delete orphaned rooms
+            await mgr.stop_call_session()
+
+            # 3. Inform ESP32 hardware to terminate ringing/call
+            mgr.device_link.send_call_end()
+
+            # 4. Flush rate limit counters
+            RATE_LIMITER.clear()
+
+            # 5. Flush extensions if explicitly requested
+            if clear_exts:
+                EXTENSIONS.extensions.clear()
+                notify_extensions_change(mgr.device_link)
+
+            # 6. Broadcast clean status to all active WebSocket clients
+            notify_status_change()
+
+        return web.json_response({
+            "status": "reset_success",
+            "timestamp": time.time(),
+            "device": DEVICE_ID,
+            "device_state": STATS.state,
+            "cleared_call_id": prev_call_id,
+            "call_queue_length": len(STATS.call_queue),
+            "rate_limits_cleared": True,
+            "extensions_cleared": clear_exts,
+            "message": "Gateway state, active calls, queues, and rate limits have been completely reset."
+        })
+
     app.router.add_get("/ping", ping_handler)
     app.router.add_get("/status", status_handler)
     app.router.add_get("/devices", devices_handler)
@@ -1315,9 +1524,17 @@ def create_app(mgr: TelephoneManager) -> web.Application:
     app.router.add_get("/call/poll", call_poll_handler)
     app.router.add_post("/call/accept", call_accept_handler)
     app.router.add_get("/extensions", extensions_list_handler)
+    app.router.add_get("/extensions/assign", extensions_assign_handler)
+    app.router.add_post("/extensions/assign", extensions_assign_handler)
     app.router.add_post("/extensions/register", extensions_register_handler)
     app.router.add_post("/extensions/deregister", extensions_deregister_handler)
     app.router.add_post("/hangup", call_end_handler)
+    app.router.add_post("/admin/reset", admin_reset_handler)
+    app.router.add_get("/admin/reset", admin_reset_handler)
+    app.router.add_post("/system/reset", admin_reset_handler)
+    app.router.add_get("/system/reset", admin_reset_handler)
+    app.router.add_post("/dev/reset", admin_reset_handler)
+    app.router.add_get("/dev/reset", admin_reset_handler)
     app.router.add_get("/esp32/ws", esp32_ws_handler)
     app.router.add_get("/client/ws", client_ws_handler)
     app.router.add_get("/", root_handler)
@@ -1345,7 +1562,7 @@ async def main():
         """Keeps Render free instance awake by pinging external URL every 10 minutes."""
         base_url = os.environ.get("RENDER_EXTERNAL_URL", "https://esp-audio.onrender.com").rstrip("/")
         ping_url = f"{base_url}/ping"
-        print(f"[keepalive] Self-ping watchdog activated for {ping_url} (interval: 600s)", flush=True)
+        print(f"[keepalive] Self-ping watchdog activated for {ping_url} (interval: 480s)", flush=True)
         await asyncio.sleep(30)
         async with aiohttp.ClientSession() as session:
             while True:
@@ -1359,7 +1576,7 @@ async def main():
                     break
                 except Exception as err:
                     print(f"[keepalive] Self-ping failed: {err}", flush=True)
-                await asyncio.sleep(600)
+                await asyncio.sleep(480)
 
     keepalive_task = asyncio.create_task(self_keepalive())
 
