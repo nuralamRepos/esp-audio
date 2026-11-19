@@ -750,6 +750,7 @@ class DownlinkPacer:
 class LiveKitSession:
     """Server-side participant that bridges ESP32 audio <-> LiveKit Room."""
     def __init__(self, pacer: DownlinkPacer, on_empty_room=None):
+        self.stopping = False
         self.pacer = pacer
         self.on_empty_room = on_empty_room
         self.room = None
@@ -792,6 +793,7 @@ class LiveKitSession:
                 if self.on_empty_room:
                     self.on_empty_room()
 
+        self.stopping = False
         print(f"[lk] connecting to {url} room={ROOM_NAME}...", flush=True)
         await self.room.connect(url, token)
         print("[lk] connected successfully to LiveKit Cloud!", flush=True)
@@ -856,6 +858,16 @@ class LiveKitSession:
                 pass
 
     async def stop(self):
+        # Set BEFORE disconnecting: room.disconnect() emits participant_disconnected
+        # / disconnected, and those handlers call on_remote_empty(), which called
+        # on_button_hangup(), which called this function again. That recursion
+        # produced the endless
+        #     [call] call ended: releasing listener lock
+        #     [link] sending call end to ESP32
+        # loop seen in the bridge log - hundreds of iterations per second, which
+        # then starved the event loop and made the call appear to hang up by
+        # itself the instant it started ringing.
+        self.stopping = True
         for t in self.tasks:
             t.cancel()
         self.tasks.clear()
@@ -928,6 +940,12 @@ class TelephoneManager:
                 print(f"[watchdog] error: {e}", flush=True)
 
     def on_remote_empty(self):
+        if self.livekit is not None and getattr(self.livekit, "stopping", False):
+            # We disconnected on purpose; this event is the echo of our own
+            # teardown, not the caller leaving.
+            return
+        if STATS.state == "IDLE":
+            return
         print("[call] caller disconnected from LiveKit room -> releasing lock", flush=True)
         self.on_button_hangup(notify_esp=True)
 
@@ -1011,6 +1029,11 @@ class TelephoneManager:
         notify_status_change()
 
     def on_button_hangup(self, notify_esp=True):
+        if STATS.state == "IDLE" and STATS.active_call_id is None:
+            # Already down. Several paths can conclude "the call is over" in the
+            # same tick (device button, watchdog, empty room, HTTP /call/end);
+            # only the first one should tear anything down.
+            return
         print("[call] call ended: releasing listener lock", flush=True)
         set_state("IDLE", f"on_button_hangup notify_esp={notify_esp}")
         STATS.is_on_hold = False
