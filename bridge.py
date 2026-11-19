@@ -476,6 +476,43 @@ class DeviceLink:
         elif self.udp_transport and self.udp_addr:
             self.udp_transport.sendto(bytes([PKT_CALL_END]), self.udp_addr)
 
+    def send_call_accept(self):
+        """Tell the ESP32 that the far end answered.
+
+        THIS WAS MISSING, AND IT IS WHY A CALL HAD NO SOUND.
+
+        When the caller pressed Answer in the Android app, /call/accept ran
+        on_button_accept(), which flipped the bridge to IN_CALL and started
+        LiveKit - but the device was never told. The ESP32 therefore stayed in
+        OLED_STATE_INCOMING with hfp_call_start_ringing() still owning the audio
+        path:
+
+            audio_pipe_set_source(AUDIO_SRC_TONE)      <- ringing tone
+            audio_pipe_net_set_active(false)           <- never set true
+
+        and audio_pipe_net_play() begins with
+
+            if (!s_net_active) return;
+
+        so every 20 ms PCM frame the bridge sent was dropped at the door. The
+        capture shows PKT_CALL_RING arriving and then no "call req: remote party
+        answered call" line at all, which is the fingerprint of a missing accept.
+        The earbuds rang, then went silent, while the phone sat in a call that
+        carried nothing.
+
+        The ESP32-initiated path already works: it sends PKT_CALL_ACCEPT itself
+        and the bridge answers with on_button_accept(notify_esp=False) so the two
+        do not echo each other.
+        """
+        print("[link] sending call accept to ESP32", flush=True)
+        if self.ws and not self.ws.closed:
+            try:
+                asyncio.create_task(self.ws.send_bytes(bytes([PKT_CALL_ACCEPT])))
+            except Exception:
+                pass
+        elif self.udp_transport and self.udp_addr:
+            self.udp_transport.sendto(bytes([PKT_CALL_ACCEPT]), self.udp_addr)
+
     def send_call_busy(self):
         if self.ws and not self.ws.closed:
             try:
@@ -666,6 +703,10 @@ class LiveKitSession:
 
     def push_uplink(self, pcm: bytes):
         if not self.source:
+            # No LiveKit session means no listener. Dropping here is correct, but
+            # it used to happen silently, so a call that never connected looked
+            # identical to one that connected and carried nothing.
+            STATS.dropped_frames += 1
             return
         if self._audio_q.full():
             try:
@@ -842,13 +883,21 @@ class TelephoneManager:
         notify_status_change()
         return True
 
-    def on_button_accept(self):
-        print("[call] answered on hardware; connecting audio on-demand", flush=True)
+    def on_button_accept(self, notify_esp=True):
+        """A call was answered.
+
+        notify_esp=False is used when the ESP32 is the one that told us (its
+        BOOT button or the earbud's own call button): it has already run
+        hfp_call_accept() and would only be re-triggered by an echo.
+        """
+        print("[call] answered; connecting audio on-demand", flush=True)
         STATS.state = "IN_CALL"
         STATS.is_on_hold = False
         STATS.call_start_time = time.time()
         STATS.ring_start_time = None
         STATS.last_activity_time = time.time()
+        if notify_esp:
+            self.device_link.send_call_accept()
         asyncio.create_task(self.start_call_session())
         notify_status_change()
 
@@ -1360,7 +1409,7 @@ def create_app(mgr: TelephoneManager) -> web.Application:
                         mgr.on_device_audio(pcm)
                     elif kind == PKT_CALL_ACCEPT:
                         print("[ws] ESP32 physical button pressed: ACCEPT CALL", flush=True)
-                        mgr.on_button_accept()
+                        mgr.on_button_accept(notify_esp=False)
                     elif kind == PKT_CALL_END:
                         print("[ws] ESP32 physical button pressed: HANG UP", flush=True)
                         mgr.on_button_hangup(notify_esp=False)
