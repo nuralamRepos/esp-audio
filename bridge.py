@@ -946,8 +946,14 @@ class TelephoneManager:
             print("[livekit] disconnecting from room (preserving quota)", flush=True)
             await self.livekit.stop()
         try:
-            lkapi = api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_KEY, LIVEKIT_SECRET)
-            await lkapi.room.delete_room(api.DeleteRoomRequest(room=ROOM_NAME))
+            # `api` must be imported HERE: the identical line inside
+            # start_call_session() binds it only in that function's local scope,
+            # so this function used to raise NameError on every single hangup and
+            # silently leak the LiveKit room (a real quota cost, and it left the
+            # bridge's own participant connected after the call ended).
+            from livekit import api as lk_api
+            lkapi = lk_api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_KEY, LIVEKIT_SECRET)
+            await lkapi.room.delete_room(lk_api.DeleteRoomRequest(room=ROOM_NAME))
             await lkapi.aclose()
             print(f"[livekit] deleted room '{ROOM_NAME}' to prevent orphan leaks and save quota", flush=True)
         except Exception as e:
